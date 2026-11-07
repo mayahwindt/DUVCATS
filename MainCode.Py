@@ -27,7 +27,13 @@ What the software does
 - Tolerance alert (green/red readout + soft chime on change).
 - Capture: window screenshot, short screen recording, raw full-resolution
   frame (16-bit TIFF), and CSV data logging.
-- Saved system profiles (persist across restarts).
+- Saved system profiles (persist across restarts), including each
+  system's calibrated zero, tied to the camera serial number; export /
+  import to move them between computers.
+- The whole session (every setting, mode, source, calibration, window
+  size, last profile) is saved when the app closes and every 30 s, and
+  restored at the next launch. Saved in ~/.duv_autocollimator/, outside
+  the app, so it survives installing a new revision.
 - Display themes, including palettes readable through laser safety glasses.
 
 Modes (display only; both use the same live camera)
@@ -129,7 +135,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.1"
+SOFTWARE_REV = "B2.2"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -202,6 +208,8 @@ INFO_LINES = 2                   # bottom info strip is always this many lines t
 VIDEO_RECORD_SECONDS = 5.0
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".duv_autocollimator")
 PROFILE_FILE = os.path.join(PROFILE_DIR, "profiles.json")
+SESSION_FILE = os.path.join(PROFILE_DIR, "session.json")   # everything restored at next launch
+AUTOSAVE_S = 30.0                # also save the session this often (in case of a crash)
 
 # Fixed literal colors for the AZ/EL tolerance readout — intentionally
 # NOT theme-dependent, so it always reads green = good / red = bad.
@@ -449,6 +457,24 @@ def ensure_emulator_spot_images(width, height, max_value_8bit=235):
     except Exception as exc:
         print(f"[emulator] could not write spot images: {exc}")
         return None
+
+
+def write_json_atomic(path, data):
+    """Write JSON so a crash mid-write can never leave a corrupt file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def roi_size_from_choice(choice):
@@ -1550,18 +1576,24 @@ class DUVAutocollimatorGUI:
         for var in (self.test_mode_var, self.mode_var, self.source_var, self.pixel_format_var,
                     self.flip_x_var, self.flip_y_var, self.tab_var, self.log_var):
             var.trace_add("write", self._refresh_toggle_colors)
+        self._last_session_json = None
+        self._last_autosave = time.perf_counter()
+        session = read_json(SESSION_FILE)
+        self._restore_session(session)        # every setting from last time
         self.theme_combo["values"] = list(THEMES.keys())
         self.profile_combo["values"] = sorted(self.system_profiles)
         self._apply_theme(self.theme_name)
-        self._show_tab("Camera")
+        self._show_tab(self.tab_var.get() if self.tab_var.get() in self.pages else "Camera")
         self._update_source_controls()
         self._update_plate_scale_label()
         self._configure_feed_axes()
         self._reset_measurement()
+        self._update_cal_label()
 
-        # connect to the real camera quietly at startup; if it isn't
-        # there, the Camera tab says so (no popup)
-        self._startup_after_id = self.root.after(150, lambda: self._select_source(DEFAULT_SOURCE, force=True,
+        # reconnect to the source used last time (the real camera on first
+        # launch) quietly; if it isn't there, the Camera tab says so
+        start_source = self.source_var.get() if self.source_var.get() in SOURCES else DEFAULT_SOURCE
+        self._startup_after_id = self.root.after(150, lambda: self._select_source(start_source, force=True,
                                                                                 interactive=False))
         self._loop_after_id = self.root.after(250, self._update_loop)
 
@@ -1688,6 +1720,8 @@ class DUVAutocollimatorGUI:
         self.profile_combo.bind("<<ComboboxSelected>>", self._load_system_profile)
         self._make_button(prof, "Save Profile", self._save_system_profile).pack(side=tk.LEFT, padx=(8, 0))
         self._make_button(prof, "Remove", self._remove_system_profile).pack(side=tk.LEFT, padx=(4, 0))
+        self._make_button(prof, "Export…", self._export_profiles).pack(side=tk.LEFT, padx=(12, 0))
+        self._make_button(prof, "Import…", self._import_profiles).pack(side=tk.LEFT, padx=(4, 0))
 
         # row 2: three columns
         outer = self._frame(self.root)
@@ -2540,7 +2574,9 @@ class DUVAutocollimatorGUI:
         src = self.source
         if src is None:
             return None
-        return (self.source_var.get(), src.sensor_w, src.sensor_h, src.flip_x, src.flip_y)
+        # the camera serial makes a saved calibration belong to ONE unit
+        return [self.source_var.get(), str(src.serial), int(src.sensor_w), int(src.sensor_h),
+                bool(src.flip_x), bool(src.flip_y)]
 
     def _set_zero(self):
         if self.last_cx is None:
@@ -2590,8 +2626,14 @@ class DUVAutocollimatorGUI:
             size = FRAME_SIZE if self.source_var.get() == "Simulator" else CAMERA_WIDTH_PX
             self.sensor_w = self.sensor_h = self.frame_w = self.frame_h = size
             self.display_offset = (0, 0)
-        if not (self.calibrated and self._cal_key == self._current_cal_key()):
-            self._clear_calibration()
+        if not self.calibrated:
+            self._clear_calibration()                  # re-center on this sensor
+        elif src is not None and self._cal_key != self._current_cal_key():
+            # a saved calibration only applies to the same camera unit and
+            # orientation it was made on. With nothing connected it's kept
+            # (so opening the app without the camera doesn't lose it).
+            self._clear_calibration(note="Saved calibration was made on a different camera or "
+                                         "orientation — cleared. Set Calibrated Zero again.")
         if self._using_simulator():
             self.source.reset_walk()
         self.last_display_frame = None
@@ -2628,6 +2670,8 @@ class DUVAutocollimatorGUI:
                 self._acquire_tick()
             except Exception as exc:          # never let one bad frame kill the loop
                 print(f"[loop] {type(exc).__name__}: {exc}")
+        if time.perf_counter() - self._last_autosave > AUTOSAVE_S:
+            self._save_session()
         self._loop_after_id = self.root.after(self._interval_ms(), self._update_loop)
 
     def _threshold_ratio(self):
@@ -3067,29 +3111,23 @@ class DUVAutocollimatorGUI:
     # ================================================================
 
     def _load_profiles_file(self):
-        try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        return read_json(PROFILE_FILE)
 
     def _write_profiles_file(self):
         try:
-            os.makedirs(PROFILE_DIR, exist_ok=True)
-            tmp = PROFILE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.system_profiles, f, indent=2)
-            os.replace(tmp, PROFILE_FILE)
+            write_json_atomic(PROFILE_FILE, self.system_profiles)
         except OSError as exc:
             messagebox.showerror("System Profile", f"Could not save profiles:\n{exc}")
 
-    def _save_system_profile(self):
-        name = self.system_name_var.get().strip()
-        if not name:
-            messagebox.showerror("System Profile", "Enter a system name first.")
-            return
-        self.system_profiles[name] = {
+    # ---------------- settings snapshot (shared by profiles + session) ----------------
+
+    def _calibration_state(self):
+        return {"calibrated": bool(self.calibrated), "zero_x_px": float(self.bias_x),
+                "zero_y_px": float(self.bias_y), "key": self._cal_key}
+
+    def _system_settings(self):
+        """Everything that belongs to one optical system."""
+        return {
             "threshold_pct": self.threshold_field.get(),
             "tolerance_arcsec": self.tolerance_field.get(),
             "focal_mm": self.focal_field.get(),
@@ -3099,13 +3137,76 @@ class DUVAutocollimatorGUI:
             "frame_rate": self.fps_ctl.get(),
             "pixel_format": self.pixel_format_var.get(),
             "roi": self.roi_var.get(),
-            "flip_x": self.flip_x_var.get(),
-            "flip_y": self.flip_y_var.get(),
+            "flip_x": bool(self.flip_x_var.get()),
+            "flip_y": bool(self.flip_y_var.get()),
+            "units": self.units_var.get(),
+            "calibration": self._calibration_state(),
+            "camera_serial": self.source.serial if self.source is not None else None,
         }
+
+    def _apply_system_settings(self, p, push_to_camera):
+        """Restore one system's settings. push_to_camera=False is used at
+        startup (the values are sent when the camera connects)."""
+        self.threshold_field.set(p.get("threshold_pct", self.threshold_field.get()))
+        self.tolerance_field.set(p.get("tolerance_arcsec", self.tolerance_field.get()))
+        self.focal_field.set(p.get("focal_mm", self.focal_field.get()))
+        if p.get("units") in DATA_UNITS:
+            self.units_var.set(p["units"])
+        for ctl, key in ((self.exposure_ctl, "exposure_ms"), (self.gain_ctl, "gain_db"),
+                         (self.black_ctl, "black_level"), (self.fps_ctl, "frame_rate")):
+            if key in p:
+                if push_to_camera:
+                    ctl._apply(p[key])
+                else:
+                    ctl.set(p[key])
+        geometry_changed = (p.get("pixel_format", self.pixel_format_var.get()) != self.pixel_format_var.get()
+                            or p.get("roi", self.roi_var.get()) != self.roi_var.get()
+                            or bool(p.get("flip_x", False)) != self.flip_x_var.get()
+                            or bool(p.get("flip_y", False)) != self.flip_y_var.get())
+        if p.get("pixel_format") in [pf for pf, _ in PIXEL_FORMATS]:
+            self.pixel_format_var.set(p["pixel_format"])
+        if p.get("roi") in ROI_CHOICES:
+            self.roi_var.set(p["roi"])
+        self.flip_x_var.set(bool(p.get("flip_x", False)))
+        self.flip_y_var.set(bool(p.get("flip_y", False)))
+
+        cal = p.get("calibration") or {}
+        if cal.get("calibrated"):
+            self.bias_x = float(cal.get("zero_x_px", self.bias_x))
+            self.bias_y = float(cal.get("zero_y_px", self.bias_y))
+            self.calibrated = True
+            self._cal_key = cal.get("key")
+        elif push_to_camera and "calibration" in p:
+            self._clear_calibration()          # profile was saved uncalibrated
+
+        if push_to_camera and geometry_changed and self.source is not None:
+            self._apply_geometry_change(pixel_format=self.pixel_format_var.get(), roi=True, flip=True)
+        if push_to_camera and self.calibrated and self.source is not None \
+                and self._cal_key != self._current_cal_key():
+            self._clear_calibration(note="This profile's calibration was made on a different camera or "
+                                         "orientation — not applied. Set Calibrated Zero again.")
+        self._update_cal_label()
+        self._update_plate_scale_label()
+        if push_to_camera:
+            self._refresh_charts()
+            self._refresh_feed()
+
+    # ---------------- system profiles ----------------
+
+    def _save_system_profile(self):
+        name = self.system_name_var.get().strip()
+        if not name:
+            messagebox.showerror("System Profile", "Enter a system name first.")
+            return
+        self.system_profiles[name] = dict(self._system_settings(),
+                                          saved=datetime.now().isoformat(timespec="seconds"),
+                                          software_rev=SOFTWARE_REV)
         self._write_profiles_file()
         self.profile_combo["values"] = sorted(self.system_profiles)
         self.profile_var.set(name)
-        self.capture_status_var.set(f"Profile “{name}” saved")
+        cal = "with calibration" if self.calibrated else "no calibration"
+        self.capture_status_var.set(f"Profile “{name}” saved ({cal})")
+        self._save_session()
 
     def _load_system_profile(self, _event=None):
         name = self.profile_var.get()
@@ -3113,25 +3214,12 @@ class DUVAutocollimatorGUI:
         if not isinstance(p, dict):
             return
         self.system_name_var.set(name)
-        self.threshold_field.set(p.get("threshold_pct", 45))
-        self.tolerance_field.set(p.get("tolerance_arcsec", 5.0))
-        self.focal_field.set(p.get("focal_mm", COLLIMATOR_FOCAL_MM_DEFAULT))
-        for ctl, key in ((self.exposure_ctl, "exposure_ms"), (self.gain_ctl, "gain_db"),
-                         (self.black_ctl, "black_level"), (self.fps_ctl, "frame_rate")):
-            if key in p:
-                ctl._apply(p[key])
-        geometry_changed = (p.get("pixel_format", self.pixel_format_var.get()) != self.pixel_format_var.get()
-                            or p.get("roi", self.roi_var.get()) != self.roi_var.get()
-                            or bool(p.get("flip_x", False)) != self.flip_x_var.get()
-                            or bool(p.get("flip_y", False)) != self.flip_y_var.get())
-        self.pixel_format_var.set(p.get("pixel_format", self.pixel_format_var.get()))
-        self.roi_var.set(p.get("roi", self.roi_var.get()))
-        self.flip_x_var.set(bool(p.get("flip_x", False)))
-        self.flip_y_var.set(bool(p.get("flip_y", False)))
-        if geometry_changed and self.source is not None:
-            self._apply_geometry_change(pixel_format=self.pixel_format_var.get(), roi=True, flip=True)
-        self._update_plate_scale_label()
+        self._apply_system_settings(p, push_to_camera=True)
+        serial = p.get("camera_serial")
+        if serial and self.source is not None and serial != self.source.serial:
+            self._note(f"Profile was saved with camera SN {serial}; connected camera is SN {self.source.serial}")
         self.capture_status_var.set(f"Profile “{name}” loaded")
+        self._save_session()
 
     def _remove_system_profile(self):
         name = self.profile_var.get().strip() or self.system_name_var.get().strip()
@@ -3144,6 +3232,129 @@ class DUVAutocollimatorGUI:
         self._write_profiles_file()
         self.profile_combo["values"] = sorted(self.system_profiles)
         self.profile_var.set("")
+        self._save_session()
+
+    def _export_profiles(self):
+        """Save all profiles to a file (to copy to another computer, or to
+        deliver with each unit)."""
+        if not self.system_profiles:
+            messagebox.showinfo("Export Profiles", "There are no saved profiles yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export profiles", defaultextension=".json", filetypes=[("Profiles", "*.json")],
+            initialdir=self.capture_dir_var.get().strip() or os.path.expanduser("~"),
+            initialfile=f"DUV_Profiles_{datetime.now().strftime('%Y%m%d')}.json")
+        if not path:
+            return
+        try:
+            write_json_atomic(path, {"duv_profiles": self.system_profiles, "software_rev": SOFTWARE_REV})
+            self.capture_status_var.set(f"Exported {len(self.system_profiles)} profile(s)")
+        except OSError as exc:
+            messagebox.showerror("Export Profiles", f"Could not write the file:\n{exc}")
+
+    def _import_profiles(self):
+        path = filedialog.askopenfilename(title="Import profiles", filetypes=[("Profiles", "*.json")])
+        if not path:
+            return
+        data = read_json(path)
+        incoming = data.get("duv_profiles", data)
+        incoming = {k: v for k, v in incoming.items() if isinstance(v, dict)}
+        if not incoming:
+            messagebox.showerror("Import Profiles", "No profiles found in that file.")
+            return
+        clash = sorted(set(incoming) & set(self.system_profiles))
+        if clash and not messagebox.askyesno(
+                "Import Profiles", "These profiles already exist and will be replaced:\n\n"
+                                   + "\n".join(clash) + "\n\nContinue?"):
+            return
+        self.system_profiles.update(incoming)
+        self._write_profiles_file()
+        self.profile_combo["values"] = sorted(self.system_profiles)
+        self.capture_status_var.set(f"Imported {len(incoming)} profile(s)")
+
+    # ---------------- session: everything, restored at next launch ----------------
+
+    def _session_state(self):
+        state = {
+            "software_rev": SOFTWARE_REV,
+            "theme": self.theme_name,
+            "custom_theme": THEMES.get("Custom"),
+            "mode": self.mode,
+            "source": self.source_var.get(),
+            "tab": self.tab_var.get(),
+            "sample_rate": self._safe_float(self.rate_var, 10.0),
+            "system_name": self.system_name_var.get(),
+            "profile": self.profile_var.get(),
+            "capture_dir": self.capture_dir_var.get(),
+            "instrument_port": self.com_var.get(),
+            "test_point": {"enabled": bool(self.test_mode_var.get()), "az": self.test_az_field.get(),
+                           "el": self.test_el_field.get(),
+                           "origin": [self.test_point_origin_x, self.test_point_origin_y]},
+            "window": self.root.geometry(),
+        }
+        state["system"] = self._system_settings()
+        return state
+
+    def _save_session(self):
+        """Write the session file (only when something changed)."""
+        self._last_autosave = time.perf_counter()
+        try:
+            state = self._session_state()
+            text = json.dumps(state, sort_keys=True)
+            if text == self._last_session_json:
+                return
+            write_json_atomic(SESSION_FILE, state)
+            self._last_session_json = text
+        except Exception as exc:              # never let saving break the app
+            print(f"[session] could not save: {exc}")
+
+    def _restore_session(self, st):
+        if not st:
+            return
+        try:
+            if isinstance(st.get("custom_theme"), dict):
+                THEMES["Custom"] = dict(THEMES[DEFAULT_THEME], **st["custom_theme"])
+            if st.get("theme") in THEMES:
+                self.theme_name = st["theme"]
+                self.theme = THEMES[self.theme_name]
+                self.theme_var.set(self.theme_name)
+            if st.get("mode") in MODES:
+                self.mode = st["mode"]
+                self.mode_var.set(self.mode)
+            if st.get("source") in SOURCES:
+                self.source_var.set(st["source"])
+            if st.get("tab"):
+                self.tab_var.set(st["tab"])
+            if st.get("sample_rate") in SAMPLE_RATES:
+                self.rate_var.set(st["sample_rate"])
+            self.system_name_var.set(st.get("system_name", ""))
+            if st.get("profile") in self.system_profiles:
+                self.profile_var.set(st["profile"])
+            if st.get("capture_dir"):
+                self.capture_dir_var.set(st["capture_dir"])
+            if st.get("instrument_port") in self.serial_ports:
+                self.com_var.set(st["instrument_port"])
+            tp = st.get("test_point") or {}
+            self.test_az_field.set(tp.get("az", 0))
+            self.test_el_field.set(tp.get("el", 0))
+            if isinstance(tp.get("origin"), list) and len(tp["origin"]) == 2:
+                self.test_point_origin_x, self.test_point_origin_y = map(float, tp["origin"])
+            self.test_mode_var.set(bool(tp.get("enabled", False)) and st.get("source") == "Simulator")
+            if isinstance(st.get("system"), dict):
+                self._apply_system_settings(st["system"], push_to_camera=False)
+            self._restore_window(st.get("window"))
+        except Exception as exc:
+            print(f"[session] could not restore everything: {exc}")
+
+    def _restore_window(self, geometry):
+        """Reopen at the last size/position, if it still fits this screen."""
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geometry or "")
+        if not m:
+            return
+        w, h, x, y = map(int, m.groups())
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if 600 <= w <= sw and 400 <= h <= sh and 0 <= x <= sw - 100 and 0 <= y <= sh - 100:
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
 
 
     # ================================================================
@@ -3475,6 +3686,7 @@ class DUVAutocollimatorGUI:
     def _exit_app(self):
         if not messagebox.askokcancel("Exit", "Close the DUV Autocollimator Control application?"):
             return
+        self._save_session()                  # restored at next launch
         self.running = False
         # cancel pending timers BEFORE destroying the window, otherwise Tk
         # fires them afterwards ('invalid command name ..._update_loop')
@@ -3585,6 +3797,9 @@ def main():
     root = tk.Tk()
     app = DUVAutocollimatorGUI(root)
     root.protocol("WM_DELETE_WINDOW", app._exit_app)
+    if platform.system() == "Darwin":
+        # Cmd+Q / app menu Quit go through the same save-and-close path
+        root.createcommand("tk::mac::Quit", app._exit_app)
     root.mainloop()
 
 

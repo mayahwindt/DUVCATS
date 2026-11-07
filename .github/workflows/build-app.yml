@@ -1,0 +1,48 @@
+name: Build app
+
+on:
+  push:
+    tags: ["B*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            name: mac
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build app
+        run: pyinstaller --name DUVCATS --windowed --noconfirm maincode.py
+
+      - name: Zip (mac)
+        if: matrix.name == 'mac'
+        run: ditto -c -k --keepParent dist/DUVCATS.app DUVCATS-${{ github.ref_name }}-mac.zip
+
+      - name: Zip (windows)
+        if: matrix.name == 'windows'
+        run: Compress-Archive -Path dist/DUVCATS -DestinationPath DUVCATS-${{ github.ref_name }}-windows.zip
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DUVCATS-*.zip
