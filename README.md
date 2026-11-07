@@ -50,4 +50,5 @@ System Settings → Privacy & Security → Screen Recording → turn on
 Visual Studio Code (or Terminal), then restart it.
 
 ## Team
-- (add names and roles)
+DUVCATS 
+Software Team: Mayah Windt and Jonathan Galhandro
