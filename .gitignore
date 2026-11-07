@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.DS_Store
+.ipynb_checkpoints/
+
+# Data the GUI saves (share through the team drive instead)
+DUV_Screenshot_*.png
+DUV_Frame_*.tiff
+DUV_Recording_*.mp4
+DUV_Recording_*.gif
+DUV_Log_*.csv
+
+# App builds
+build/
+dist/
+*.spec
