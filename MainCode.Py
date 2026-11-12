@@ -135,7 +135,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.2"
+SOFTWARE_REV = "B2.4"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -145,7 +145,10 @@ ARC_SEC_PER_RAD = 206264.806
 MICRO_RAD_PER_ARC_SEC = 1_000_000.0 / ARC_SEC_PER_RAD  # ~4.84814
 
 SAMPLE_RATES = [1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
-DATA_UNITS = ["Arc-Sec", "Micro-Radian"]
+# "Millimeter" = linear displacement of the Return spot from the Source
+# ON THE SENSOR (pixels x pixel pitch). Used to verify the centroid with a
+# known linear move (translation stage) before trusting angular readings.
+DATA_UNITS = ["Arc-Sec", "Micro-Radian", "Millimeter"]
 MODES = ["Alignment", "Metrology"]
 SOURCES = ["Camera", "Emulator", "Simulator"]
 DEFAULT_MODE = "Alignment"
@@ -2756,15 +2759,34 @@ class DUVAutocollimatorGUI:
     # Readouts and charts
     # ================================================================
 
+    def _pixel_mm(self):
+        """Sensor pixel pitch in mm (2.74 µm on the a2A4504)."""
+        return CAMERA_PIXEL_UM / 1000.0
+
+    def _arcsec_to_mm(self, value_arcsec):
+        """Angle reading -> linear spot displacement on the sensor, in mm.
+        Same signs as AZ (right +) and EL (up +)."""
+        aspp = self._arcsec_per_px()
+        if value_arcsec is None or not aspp:
+            return None
+        return value_arcsec / aspp * self._pixel_mm()
+
     def _convert(self, value_arcsec):
         if value_arcsec is None:
             return None
-        if self.units_var.get() == "Micro-Radian":
+        unit = self.units_var.get()
+        if unit == "Micro-Radian":
             return value_arcsec * MICRO_RAD_PER_ARC_SEC
+        if unit == "Millimeter":
+            return self._arcsec_to_mm(value_arcsec)
         return value_arcsec
 
     def _units_short(self):
-        return "µrad" if self.units_var.get() == "Micro-Radian" else "arc-sec"
+        return {"Micro-Radian": "µrad", "Millimeter": "mm"}.get(self.units_var.get(), "arc-sec")
+
+    def _decimals(self):
+        """mm values are small (1 px = 0.00274 mm), so show more digits."""
+        return 4 if self.units_var.get() == "Millimeter" else 2
 
     def _fit_readout(self, event=None):
         """Largest digit size that fits the column, so the AZ/EL numbers
@@ -2799,15 +2821,17 @@ class DUVAutocollimatorGUI:
         if not hasattr(self, "az_label"):
             return
         az, el = self._convert(self.last_az), self._convert(self.last_el)
-        self.az_label.config(text=f"{az:+08.2f}" if az is not None else "  NO SIG")
-        self.el_label.config(text=f"{el:+08.2f}" if el is not None else "  NO SIG")
+        d = self._decimals()
+        self.az_label.config(text=f"{az:+08.{d}f}" if az is not None else "  NO SIG")
+        self.el_label.config(text=f"{el:+08.{d}f}" if el is not None else "  NO SIG")
         self.signal_box.value_label.config(text=str(self.last_signal))
         u = self._units_short()
         az_rms, el_rms = self._stats(self.az_hist), self._stats(self.el_hist)
         if az_rms is not None and el_rms is not None:
-            self.az_noise_box.value_label.config(text=f"{self._convert(az_rms):.3f}")
-            self.el_noise_box.value_label.config(text=f"{self._convert(el_rms):.3f}")
-            self.metric_labels["repeatability"].config(text=f"{self._convert(2 * max(az_rms, el_rms)):.3f} {u}")
+            nd = self._decimals() + 1
+            self.az_noise_box.value_label.config(text=f"{self._convert(az_rms):.{nd}f}")
+            self.el_noise_box.value_label.config(text=f"{self._convert(el_rms):.{nd}f}")
+            self.metric_labels["repeatability"].config(text=f"{self._convert(2 * max(az_rms, el_rms)):.{nd}f} {u}")
         else:
             self.az_noise_box.value_label.config(text="--")
             self.el_noise_box.value_label.config(text="--")
@@ -2837,7 +2861,7 @@ class DUVAutocollimatorGUI:
             finite = vals[np.isfinite(vals)] if vals.size else vals
             if finite.size:
                 lo, hi = float(finite.min()), float(finite.max())
-                pad = max(0.5, (hi - lo) * 0.2)
+                pad = max(0.001 if u == "mm" else 0.5, (hi - lo) * 0.2)
                 ax.set_ylim(lo - pad, hi + pad)
             ax.set_ylabel(f"{name} ({u})", color=self.theme["plot_fg"], fontsize=8)
             canvas.draw_idle()
@@ -3458,7 +3482,8 @@ class DUVAutocollimatorGUI:
 
     _CSV_HEADER = ["timestamp", "elapsed_s", "source", "az_arcsec", "el_arcsec", "centroid_x_px", "centroid_y_px",
                    "signal_pct", "peak_counts", "background_counts", "saturated", "spot_px", "exposure_ms",
-                   "gain_db", "sensor_temp_c", "calibrated", "zero_x_px", "zero_y_px", "arcsec_per_px"]
+                   "gain_db", "sensor_temp_c", "calibrated", "zero_x_px", "zero_y_px", "arcsec_per_px",
+                   "az_mm_sensor", "el_mm_sensor"]
 
     def _toggle_csv_log(self):
         if self._csv_file is not None:
@@ -3490,7 +3515,8 @@ class DUVAutocollimatorGUI:
                 self.source_var.get(), f(self.last_az), f(self.last_el), f(self.last_cx, 3), f(self.last_cy, 3),
                 self.last_signal, self.last_peak_raw, f(self.last_background, 1), int(self.last_saturated),
                 f(self.last_spot_px, 3), f(self.exposure_actual_ms), f(self.gain_ctl.get(), 2), f(self.temp_c, 1),
-                int(self.calibrated), f(self.bias_x, 3), f(self.bias_y, 3), f(self._arcsec_per_px(), 6)])
+                int(self.calibrated), f(self.bias_x, 3), f(self.bias_y, 3), f(self._arcsec_per_px(), 6),
+                f(self._arcsec_to_mm(self.last_az), 5), f(self._arcsec_to_mm(self.last_el), 5)])
             self._csv_rows += 1
             if self._csv_rows % 10 == 0:
                 self._csv_file.flush()
