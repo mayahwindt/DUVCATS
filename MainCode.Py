@@ -36,10 +36,17 @@ What the software does
   the app, so it survives installing a new revision.
 - Display themes, including palettes readable through laser safety glasses.
 
-Modes (display only; both use the same live camera)
----------------------------------------------------
-- Alignment: Source/Return points on a graph of the whole sensor.
-- Metrology: the live camera image (zoomed to the ROI) with overlays.
+Modes (both use the same live camera)
+-------------------------------------
+- Alignment: the live spot image (ROI) with Source and Return crosshairs,
+             the AZ/EL readout, strip charts, X-Y plot and controls.
+- Metrology: the camera feed only, enlarged to fill the window, to look
+             at the optical system being worked on.
+
+Menu (the ☰ button, top left)
+----------------------------
+Display theme, Customize Colors, Text Size, System Profiles (save /
+load / remove / export / import), Samples per second, Instrument Port.
 
 Camera sources
 --------------
@@ -126,6 +133,10 @@ from matplotlib.ticker import FixedLocator, FuncFormatter  # noqa: E402
 try:
     from PIL import Image, ImageDraw, ImageGrab
     PIL_AVAILABLE = True
+    try:
+        from PIL import ImageTk          # big Metrology view
+    except ImportError:
+        ImageTk = None
 except ImportError:
     PIL_AVAILABLE = False
 
@@ -135,7 +146,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.4"
+SOFTWARE_REV = "B2.6"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -186,6 +197,8 @@ GAIN_MAX_DB = 24.0
 BLACK_LEVEL_MAX = 255.0
 FRAME_RATE_DEFAULT = 10.0
 
+METRO_DISPLAY_PX = 1600          # Metrology mode: larger live image for the big view
+TEXT_SIZES = {"Small": 0.85, "Normal": 1.0, "Large": 1.2, "Extra Large": 1.4}
 DISPLAY_MAX_PX = 500             # live image is block-averaged to ~this size for DISPLAY only
 CHART_HISTORY = 300
 STATS_WINDOW = 50                # samples used for RMS noise / repeatability
@@ -407,9 +420,8 @@ def pin_square_axes(fig, ax, margins):
     mode or data can then never move or resize the plot (matplotlib's
     automatic layout shifts the axes whenever tick labels change width,
     e.g. "350" on the simulator vs "4000" on the camera)."""
-    left, right, top, bottom = margins
-
     def _layout(_event=None):
+        left, right, top, bottom = margins      # a list: Text Size can change it
         w_px, h_px = fig.get_size_inches() * fig.dpi
         if w_px < 10 or h_px < 10:
             return
@@ -508,8 +520,12 @@ def process_frame(frame, max_value, threshold_ratio, offset=(0, 0), display_max_
     ox, oy = offset
     step = max(1, int(math.ceil(max(h, w) / float(display_max_px))))
     hh, ww = (h // step) * step, (w // step) * step
-    small = frame[:hh, :ww].reshape(hh // step, step, ww // step, step).mean(axis=(1, 3), dtype=np.float32)
-    display = np.clip(small * (255.0 / max_value), 0, 255).astype(np.uint8)
+    blocks = frame[:hh, :ww].reshape(hh // step, step, ww // step, step)
+    small = blocks.mean(axis=(1, 3), dtype=np.float32)
+    # Display uses each block's BRIGHTEST pixel, not the average: a tight
+    # spot (~12 px) averaged over 9x9-pixel blocks on the full 20 MP frame
+    # faded almost to black on screen. Detection/centroid still use `small`.
+    display = np.clip(blocks.max(axis=(1, 3)).astype(np.float32) * (255.0 / max_value), 0, 255).astype(np.uint8)
 
     background = float(np.median(small))
     peak_small = float(small.max())
@@ -727,7 +743,8 @@ class SimulatedSource:
         if self.flip_y:
             frame = frame[::-1, :]
         self._raw = frame
-        res = process_frame(frame, self.max_value, self.threshold_ratio)
+        res = process_frame(frame, self.max_value, self.threshold_ratio,
+                            display_max_px=getattr(self, "display_max_px", DISPLAY_MAX_PX))
         res["t"] = time.perf_counter()
         self._frame_id += 1
         return self._frame_id, res
@@ -1127,7 +1144,8 @@ class BaslerSource:
                     pass
 
             try:
-                processed = process_frame(frame, self.max_value, self.threshold_ratio, self.offset)
+                processed = process_frame(frame, self.max_value, self.threshold_ratio, self.offset,
+                                          display_max_px=getattr(self, "display_max_px", DISPLAY_MAX_PX))
             except Exception as exc:
                 self.last_error = f"Processing error: {exc}"
                 continue
@@ -1505,6 +1523,12 @@ class DUVAutocollimatorGUI:
         # ---- measurement / display settings ----
         self.units_var = tk.StringVar(value=DATA_UNITS[0])
         self.rate_var = tk.DoubleVar(value=10.0)
+        self.text_size_var = tk.StringVar(value="Normal")
+        self.text_scale = 1.0
+        self._font_base = {}
+        self._feed_margins = list(FEED_MARGINS)
+        self._xy_margins = list(XY_MARGINS)
+        self._metro_photo = None
         self.serial_ports = list_serial_ports()
         self.com_var = tk.StringVar(value=self.serial_ports[0])
         self.theme_var = tk.StringVar(value=self.theme_name)
@@ -1583,7 +1607,6 @@ class DUVAutocollimatorGUI:
         self._last_autosave = time.perf_counter()
         session = read_json(SESSION_FILE)
         self._restore_session(session)        # every setting from last time
-        self.theme_combo["values"] = list(THEMES.keys())
         self.profile_combo["values"] = sorted(self.system_profiles)
         self._apply_theme(self.theme_name)
         self._show_tab(self.tab_var.get() if self.tab_var.get() in self.pages else "Camera")
@@ -1592,6 +1615,9 @@ class DUVAutocollimatorGUI:
         self._configure_feed_axes()
         self._reset_measurement()
         self._update_cal_label()
+        self._update_system_label()
+        self._apply_text_size(self.text_size_var.get())
+        self._set_mode(self.mode)
 
         # reconnect to the source used last time (the real camera on first
         # launch) quietly; if it isn't there, the Camera tab says so
@@ -1693,42 +1719,25 @@ class DUVAutocollimatorGUI:
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(2, weight=1)
 
-        # row 0: theme + mode
+        # row 0: ☰ menu, mode switch, current system
         top = self._frame(self.root)
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
-        self._label(top, "Display Theme:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
-        self.theme_combo = self._make_dropdown(top, self.theme_var, [], width=32)
-        self.theme_combo.pack(side=tk.LEFT)
-        self.theme_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_theme(self.theme_var.get()))
-        self._make_button(top, "Customize Colors…", self._open_color_customizer).pack(side=tk.LEFT, padx=(8, 0))
-        self._label(top, "Mode:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(24, 6))
+        self.menu_btn = self._make_button(top, "☰", self._open_main_menu, font=("Arial", 15, "bold"))
+        self.menu_btn.pack(side=tk.LEFT, padx=(0, 14))
+        self._label(top, "Mode:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
         for m in MODES:
             self._make_chip(top, m, self.mode_var, m, command=lambda m=m: self._set_mode(m)).pack(
                 side=tk.LEFT, padx=(0, 4))
+        self.system_label = self._label(top, "", font=("Arial", 10, "bold"), anchor="e")
+        self.system_label.pack(side=tk.RIGHT)
+        self.system_name_var.trace_add("write", lambda *a: self._update_system_label())
+        self._build_profile_window()
 
-        # row 1: system profile
-        prof = self._frame(self.root)
-        prof.grid(row=1, column=0, sticky="ew", padx=8, pady=(6, 0))
-        self._label(prof, "System Name:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
-        self.system_name_entry = tk.Entry(prof, textvariable=self.system_name_var, font=("Arial", 10),
-                                          width=16, relief=tk.FLAT, bd=2, highlightthickness=1)
-        self.system_name_entry.pack(side=tk.LEFT)
-        self.reg["entries"].append(self.system_name_entry)
-        self._label(prof, "Detection Threshold (%):", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(14, 6))
-        self.threshold_field = self._make_number(prof, 45, 1, 99, 1, 0, width=4)
-        self.threshold_field.pack(side=tk.LEFT)
-        self._label(prof, "Saved Profiles:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(14, 6))
-        self.profile_combo = self._make_dropdown(prof, self.profile_var, [], width=18)
-        self.profile_combo.pack(side=tk.LEFT)
-        self.profile_combo.bind("<<ComboboxSelected>>", self._load_system_profile)
-        self._make_button(prof, "Save Profile", self._save_system_profile).pack(side=tk.LEFT, padx=(8, 0))
-        self._make_button(prof, "Remove", self._remove_system_profile).pack(side=tk.LEFT, padx=(4, 0))
-        self._make_button(prof, "Export…", self._export_profiles).pack(side=tk.LEFT, padx=(12, 0))
-        self._make_button(prof, "Import…", self._import_profiles).pack(side=tk.LEFT, padx=(4, 0))
-
-        # row 2: three columns
+        # row 2: three columns (Alignment) or the big camera view (Metrology)
         outer = self._frame(self.root)
         outer.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        self.outer = outer
+        self._build_metrology_view()
         outer.grid_rowconfigure(0, weight=1)
         # Column widths are a FIXED share of the window (uniform group +
         # weights) and the column frames don't propagate their contents'
@@ -1757,7 +1766,8 @@ class DUVAutocollimatorGUI:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(1, weight=1)
 
-        self.feed_title_label = self._label(parent, "", font=("Arial", 12, "bold"), anchor="w", width=1)
+        self.feed_title_label = self._label(parent, "Live Spot Image", font=("Arial", 12, "bold"),
+                                            anchor="w", width=1)
         self.feed_title_label.grid(row=0, column=0, sticky="ew")
 
         self.cam_fig = Figure(figsize=(4.4, 4.4), dpi=90)
@@ -1766,7 +1776,7 @@ class DUVAutocollimatorGUI:
         cam_widget.grid(row=1, column=0, sticky="nsew", pady=(2, 6))
         self._init_feed_artists()
         # identical square plot box in every mode and for every source
-        pin_square_axes(self.cam_fig, self.cam_ax, FEED_MARGINS)
+        self._feed_layout = pin_square_axes(self.cam_fig, self.cam_ax, self._feed_margins)
 
         # tab chips
         tabs = self._frame(parent)
@@ -1873,6 +1883,13 @@ class DUVAutocollimatorGUI:
         self.plate_scale_label = self._label(r3, "", font=self.mono9, anchor="e")
         self.plate_scale_label.pack(side=tk.RIGHT)
 
+        r4 = self._frame(page)
+        r4.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 0), padx=4)
+        self._label(r4, "Threshold", anchor="w", width=9).pack(side=tk.LEFT)
+        self.threshold_field = self._make_number(r4, 45, 1, 99, 1, 0, width=4)
+        self.threshold_field.pack(side=tk.LEFT)
+        self._label(r4, "%  spot detection level").pack(side=tk.LEFT, padx=(3, 0))
+
     def _build_test_page(self, page):
         page.grid_columnconfigure(1, weight=1)
         self.test_note = self._label(page, "", font=("Arial", 9), anchor="w", justify="left", wraplength=360)
@@ -1932,11 +1949,7 @@ class DUVAutocollimatorGUI:
         for c in range(3):
             row1.grid_columnconfigure(c, weight=1, uniform="stats1")
         self.signal_box = self._stat_box(row1, "Signal (%)", 0)
-        rate_box = self._frame(row1, highlightthickness=1)
-        rate_box.grid(row=0, column=1, padx=3, sticky="nsew")
-        self._label(rate_box, "Samples / s", font=("Arial", 9)).pack(pady=(2, 0))
-        rate_dd = self._make_dropdown(rate_box, self.rate_var, SAMPLE_RATES, width=5, font=("Arial", 12, "bold"))
-        rate_dd.pack(pady=(0, 4))
+        self.spot_box = self._stat_box(row1, "Spot Size (px)", 1)
         units_box = self._frame(row1, highlightthickness=1)
         units_box.grid(row=0, column=2, padx=3, sticky="nsew")
         self._label(units_box, "Data Units", font=("Arial", 9)).pack(pady=(2, 0))
@@ -1946,10 +1959,11 @@ class DUVAutocollimatorGUI:
 
         row2 = self._frame(parent)
         row2.grid(row=4, column=0, sticky="ew", pady=2)
-        for c in range(2):
+        for c in range(3):
             row2.grid_columnconfigure(c, weight=1, uniform="stats2")
         self.az_noise_box = self._stat_box(row2, "AZ Noise (RMS)", 0)
         self.el_noise_box = self._stat_box(row2, "EL Noise (RMS)", 1)
+        self.repeat_box = self._stat_box(row2, "Repeatability 2σ", 2)
 
         self.az_fig = Figure(figsize=(3.9, 2.2), dpi=90)
         self.az_ax = self.az_fig.add_axes([0.20, 0.16, 0.76, 0.78])
@@ -1989,43 +2003,26 @@ class DUVAutocollimatorGUI:
         # the plot whenever the tick labels changed width)
         self.xy_fig = Figure(figsize=(4.4, 3.0), dpi=90)
         self.xy_ax = self.xy_fig.add_axes([0.15, 0.15, 0.8, 0.8])
-        (self.xy_connector,) = self.xy_ax.plot([], [], linewidth=1.0, linestyle=(0, (3, 2)), alpha=0.8)
+        # Source (red) and Return (green) drawn as crosshairs
+        self.xy_src_h = self.xy_ax.axhline(0, linewidth=0.9)
+        self.xy_src_v = self.xy_ax.axvline(0, linewidth=0.9)
+        self.xy_ret_h = self.xy_ax.axhline(0, linewidth=0.9, visible=False)
+        self.xy_ret_v = self.xy_ax.axvline(0, linewidth=0.9, visible=False)
         (self.xy_source_point,) = self.xy_ax.plot([0], [0], "+", markersize=11, markeredgewidth=2)
         self.xy_source_label = self.xy_ax.annotate("Source", (0, 0), xytext=(8, 8), textcoords="offset points",
                                                    fontsize=8, fontweight="bold")
-        (self.xy_point,) = self.xy_ax.plot([], [], "o", markersize=9)
+        (self.xy_point,) = self.xy_ax.plot([], [], "+", markersize=14, markeredgewidth=2)
         self.xy_return_label = self.xy_ax.annotate("Return", (0, 0), xytext=(8, -12), textcoords="offset points",
                                                    fontsize=8, fontweight="bold")
         self.xy_return_label.set_visible(False)
         self.xy_canvas, w = self._make_canvas(self.xy_fig, xy, 300, 150)
         w.grid(row=1, column=0, sticky="nsew")
-        pin_square_axes(self.xy_fig, self.xy_ax, XY_MARGINS)
+        self._xy_layout = pin_square_axes(self.xy_fig, self.xy_ax, self._xy_margins)
         self.xy_ax.xaxis.set_major_formatter(FuncFormatter(tick_label))
         self.xy_ax.yaxis.set_major_formatter(FuncFormatter(tick_label))
 
-        metrics = self._labelframe(parent, "Digital Metrology Metrics")
-        metrics.grid(row=1, column=0, sticky="ew", pady=(6, 3))
-        metrics.grid_columnconfigure(1, weight=1)
-        self.metric_labels = {}
-        rows = [
-            ("centroid_px", "Centroid (sensor px)"),
-            ("bias_px", "Calibrated Zero (sensor px)"),
-            ("plate_scale", "Plate Scale (arc-sec/px)"),
-            ("spot_size", "Spot Size (px) — smaller = sharper"),
-            ("repeatability", "Repeatability, 2σ"),
-            ("peak_signal", "Peak / Background Counts"),
-            ("frame_rate", "Frame Rate Received (fps)"),
-            ("exposure_time", "Exposure, Actual (ms)"),
-            ("temperature", "Sensor Temperature (°C)"),
-        ]
-        for i, (key, text) in enumerate(rows):
-            self._label(metrics, text, font=("Arial", 9), anchor="w").grid(row=i, column=0, sticky="w", padx=4)
-            val = self._label(metrics, "--", role="readout", relief=tk.SUNKEN, width=17, font=(self.mono, 9, "bold"))
-            val.grid(row=i, column=1, sticky="e", padx=4, pady=1)
-            self.metric_labels[key] = val
-
         cap = self._labelframe(parent, "Capture")
-        cap.grid(row=2, column=0, sticky="ew", pady=3)
+        cap.grid(row=1, column=0, sticky="ew", pady=(6, 3))
         cap.grid_columnconfigure(0, weight=1)
         path_row = self._frame(cap)
         path_row.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 2))
@@ -2060,14 +2057,9 @@ class DUVAutocollimatorGUI:
         # grid (not pack): the port column gives up width first, so the
         # Restart / Pause / Exit buttons always keep their full size
         ctrl = self._frame(parent)
-        ctrl.grid(row=3, column=0, sticky="ew", pady=(6, 3))
+        ctrl.grid(row=2, column=0, sticky="ew", pady=(6, 3))
         ctrl.grid_columnconfigure(0, weight=1)
-        port_box = self._frame(ctrl)
-        port_box.grid(row=0, column=0, sticky="w")
-        # Reserved for a future serial link to the instrument electronics
-        # (e.g. computer-controlled LEDs). Nothing uses it yet.
-        self._label(port_box, "Instrument Port", font=("Arial", 8), anchor="w").pack(anchor="w")
-        self._make_dropdown(port_box, self.com_var, self.serial_ports, width=14, font=("Arial", 9)).pack(anchor="w")
+        # (the reserved Instrument Port selector is in the ☰ menu)
         self._make_button(ctrl, "Restart", self._restart, width=7).grid(row=0, column=1, padx=(6, 0))
         self.pause_btn = self._make_button(ctrl, "Pause", self._toggle_pause, font=("Arial", 11, "bold"), width=8)
         self.pause_btn.grid(row=0, column=2, padx=(6, 0))
@@ -2079,9 +2071,193 @@ class DUVAutocollimatorGUI:
         self.info_label = self._label(parent, "", role="readout", relief=tk.SUNKEN, font=("Arial", 9),
                                       anchor="nw", justify="left", padx=4, pady=2, width=1,
                                       height=INFO_LINES)
-        self.info_label.grid(row=4, column=0, sticky="ew", pady=(3, 0))
+        self.info_label.grid(row=3, column=0, sticky="ew", pady=(3, 0))
         self.info_label.bind("<Configure>", lambda e: self.info_label.configure(wraplength=max(100, e.width - 10)))
 
+
+    # ================================================================
+    # ☰ menu, System Profiles window, Metrology view, Text Size
+    # ================================================================
+
+    def _open_main_menu(self):
+        """The ☰ menu. Rebuilt each time it opens so it always lists the
+        current themes (e.g. a new Custom theme) and serial ports."""
+        menu = tk.Menu(self.root, tearoff=0)
+        theme_m = tk.Menu(menu, tearoff=0)
+        for name in THEMES:
+            theme_m.add_radiobutton(label=name, variable=self.theme_var, value=name,
+                                    command=lambda n=name: self._apply_theme(n))
+        menu.add_cascade(label="Display Theme", menu=theme_m)
+        menu.add_command(label="Customize Colors…", command=self._open_color_customizer)
+        size_m = tk.Menu(menu, tearoff=0)
+        for name in TEXT_SIZES:
+            size_m.add_radiobutton(label=name, variable=self.text_size_var, value=name,
+                                   command=lambda n=name: self._apply_text_size(n))
+        menu.add_cascade(label="Text Size", menu=size_m)
+        menu.add_separator()
+        menu.add_command(label="System Profiles…", command=self._show_profile_window)
+        rate_m = tk.Menu(menu, tearoff=0)
+        for r in SAMPLE_RATES:
+            rate_m.add_radiobutton(label=f"{r:g} per second", variable=self.rate_var, value=r)
+        menu.add_cascade(label="Samples / s", menu=rate_m)
+        port_m = tk.Menu(menu, tearoff=0)
+        for port in self.serial_ports:
+            port_m.add_radiobutton(label=port, variable=self.com_var, value=port)
+        menu.add_cascade(label="Instrument Port (reserved)", menu=port_m)
+        menu.add_separator()
+        menu.add_command(label="Exit", command=self._exit_app)
+        self._main_menu = menu                     # keep a reference while it is open
+        x = self.menu_btn.winfo_rootx()
+        y = self.menu_btn.winfo_rooty() + self.menu_btn.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _build_profile_window(self):
+        """System Profiles window (opened from the ☰ menu). Built once and
+        hidden, so its fields keep their values."""
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title("System Profiles")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        self.profile_win = win
+        body = self._frame(win)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        self._label(body, "System Name", font=("Arial", 10, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        self.system_name_entry = tk.Entry(body, textvariable=self.system_name_var, font=("Arial", 10),
+                                          width=24, relief=tk.FLAT, bd=2, highlightthickness=1)
+        self.system_name_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        self.reg["entries"].append(self.system_name_entry)
+        self._make_button(body, "Save Profile", self._save_system_profile).grid(row=0, column=2, sticky="ew",
+                                                                               padx=(8, 0))
+        self._label(body, "Saved Profiles", font=("Arial", 10, "bold"), anchor="w").grid(row=1, column=0,
+                                                                                         sticky="w")
+        self.profile_combo = self._make_dropdown(body, self.profile_var, [], width=22)
+        self.profile_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+        self.profile_combo.bind("<<ComboboxSelected>>", self._load_system_profile)
+        self._make_button(body, "Remove", self._remove_system_profile).grid(row=1, column=2, sticky="ew",
+                                                                           padx=(8, 0))
+        row = self._frame(body)
+        row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self._make_button(row, "Export…", self._export_profiles).pack(side=tk.LEFT)
+        self._make_button(row, "Import…", self._import_profiles).pack(side=tk.LEFT, padx=(6, 0))
+        self._make_button(row, "Close", win.withdraw).pack(side=tk.RIGHT)
+        self._label(body, "Choosing a saved profile loads it. A profile stores the camera and measurement\n"
+                          "settings and the calibrated zero for one optical system.",
+                    font=("Arial", 9), anchor="w", justify="left").grid(row=3, column=0, columnspan=3,
+                                                                         sticky="w", pady=(10, 0))
+
+    def _show_profile_window(self):
+        win = self.profile_win
+        win.configure(bg=self.theme["panel_bg"])
+        win.deiconify()
+        win.update_idletasks()
+        win.geometry(f"+{self.root.winfo_rootx() + 60}+{self.root.winfo_rooty() + 60}")
+        win.lift()
+        win.focus_force()
+
+    def _update_system_label(self):
+        name = self.system_name_var.get().strip()
+        self.system_label.config(text=f"System: {name}" if name else "System: none  (☰ › System Profiles)")
+
+    def _build_metrology_view(self):
+        """Metrology mode: just the live camera feed, as large as the
+        window allows (aspect kept), with fps / size / saturation text."""
+        self.metro_frame = tk.Frame(self.root, bg="black")
+        self.metro_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        self.metro_canvas = tk.Canvas(self.metro_frame, bg="black", highlightthickness=0)
+        self.metro_canvas.pack(fill=tk.BOTH, expand=True)
+        c = self.metro_canvas
+        self._metro_img_item = c.create_image(0, 0, anchor="center")
+        self._metro_info = c.create_text(12, 10, anchor="nw", fill="#ffbf00", font=(self.mono, 12, "bold"))
+        self._metro_msg = c.create_text(0, 0, anchor="center", fill="#cccccc", font=("Arial", 14))
+        self._metro_sat = c.create_text(0, 0, anchor="s", fill="#ff4040", font=("Arial", 14, "bold"))
+        c.bind("<Configure>", lambda e: self._refresh_metro())
+        self.metro_frame.grid_remove()
+
+    def _refresh_metro(self):
+        if self.mode != "Metrology" or not hasattr(self, "metro_canvas"):
+            return
+        c = self.metro_canvas
+        cw, ch = max(1, c.winfo_width()), max(1, c.winfo_height())
+        frame = self.last_display_frame if self.source is not None else None
+        c.coords(self._metro_msg, cw / 2, ch / 2)
+        c.coords(self._metro_sat, cw / 2, ch - 12)
+        c.itemconfigure(self._metro_sat, text="SATURATED" if self.last_saturated else "")
+        if frame is None or not PIL_AVAILABLE or ImageTk is None:
+            c.itemconfigure(self._metro_img_item, image="")
+            self._metro_photo = None
+            msg = ("No camera connected.\nSwitch to Alignment and choose a source on the Camera tab."
+                   if self.source is None else "Waiting for camera…")
+            c.itemconfigure(self._metro_msg, text=msg)
+            c.itemconfigure(self._metro_info, text="")
+            return
+        h, w = frame.shape[:2]
+        scale = min(cw / float(w), ch / float(h))
+        size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        img = Image.fromarray(frame).resize(size, Image.NEAREST if scale >= 2 else Image.BILINEAR)
+        self._metro_photo = ImageTk.PhotoImage(img)     # keep a reference or Tk drops it
+        c.itemconfigure(self._metro_img_item, image=self._metro_photo)
+        c.coords(self._metro_img_item, cw / 2, ch / 2)
+        c.itemconfigure(self._metro_msg, text="")
+        fps = f"{self.measured_fps:.1f} fps" if self.measured_fps > 0 else "-- fps"
+        c.itemconfigure(self._metro_info, text=f"{fps}   {self.frame_w}×{self.frame_h} px")
+
+    def _apply_text_size(self, name):
+        """Scale every piece of GUI text (Tk widgets and plot text) from its
+        original size. The AZ/EL readout already sizes itself to fit."""
+        scale = TEXT_SIZES.get(name, 1.0)
+        self.text_size_var.set(name if name in TEXT_SIZES else "Normal")
+        self.text_scale = scale
+        skip = {str(w) for w in (self.az_label, self.el_label, self.az_tag_label, self.el_tag_label)}
+
+        def walk(w):
+            yield w
+            for child in w.winfo_children():
+                yield from walk(child)
+
+        for w in walk(self.root):
+            key = str(w)
+            if key in skip or isinstance(w, tk.Menu):
+                continue
+            try:
+                current = w.cget("font")
+            except tk.TclError:
+                continue
+            if key not in self._font_base:
+                try:
+                    a = tkfont.Font(root=self.root, font=current).actual()
+                except tk.TclError:
+                    continue
+                self._font_base[key] = (a["family"], abs(int(a["size"])) or 10, a["weight"], a["slant"])
+            fam, size, weight, slant = self._font_base[key]
+            spec = (fam, max(6, int(round(size * scale))), weight) + (("italic",) if slant == "italic" else ())
+            try:
+                w.configure(font=spec)
+            except tk.TclError:
+                pass
+        # plot text (annotations, overlays); axis titles and tick numbers
+        # are set from self.text_scale where they are drawn
+        for ax in (self.cam_ax, self.az_ax, self.el_ax, self.xy_ax):
+            for t in ax.texts:
+                if not hasattr(t, "_duv_base_fs"):
+                    t._duv_base_fs = t.get_fontsize()
+                t.set_fontsize(t._duv_base_fs * scale)
+        # room for bigger tick numbers / axis titles left of and below plots
+        for live, base in ((self._feed_margins, FEED_MARGINS), (self._xy_margins, XY_MARGINS)):
+            live[:] = [int(round(v * (scale if i in (0, 3) else 1.0))) for i, v in enumerate(base)]
+        if hasattr(self, "_feed_layout"):
+            self._feed_layout()
+            self._xy_layout()
+        # the tab page area is sized to its tallest page
+        self.page_host.update_idletasks()
+        tallest = max(p.winfo_reqheight() for p in self.pages.values())
+        self.page_host.configure(height=tallest + 16)
+        self._configure_feed_axes()
+        self._apply_theme(self.theme_name)
 
     # ================================================================
     # Tabs, modes, feed display
@@ -2098,6 +2274,17 @@ class DUVAutocollimatorGUI:
             return
         self.mode = mode
         self.mode_var.set(mode)
+        if self.source is not None:
+            self.source.display_max_px = METRO_DISPLAY_PX if mode == "Metrology" else DISPLAY_MAX_PX
+        if mode == "Metrology":
+            self.outer.grid_remove()
+            self.metro_frame.grid()
+            self.root.after_idle(self._refresh_metro)
+        else:
+            self.metro_frame.grid_remove()
+            self.outer.grid()
+            self._refresh_readouts()
+            self._refresh_charts()
         self._configure_feed_axes()
         self._update_info_row()
         self._refresh_feed()
@@ -2117,8 +2304,11 @@ class DUVAutocollimatorGUI:
         self.feed_src_text = ax.annotate("Source", (0, 0), xytext=(6, -11), textcoords="offset points",
                                          fontsize=8, fontweight="bold", zorder=3)
         (self.feed_conn,) = ax.plot([], [], linewidth=1.0, linestyle=(0, (3, 2)), alpha=0.85, zorder=3)
-        (self.feed_ret,) = ax.plot([], [], "o", markerfacecolor="none", markersize=14, markeredgewidth=1.5,
-                                   zorder=4)
+        # Return = green crosshair (full-length lines + center mark), like
+        # the Source's red crosshair
+        self.feed_ret_h = ax.axhline(0, linewidth=0.9, zorder=4, visible=False)
+        self.feed_ret_v = ax.axvline(0, linewidth=0.9, zorder=4, visible=False)
+        (self.feed_ret,) = ax.plot([], [], "+", markersize=14, markeredgewidth=2, zorder=4)
         self.feed_ret_text = ax.annotate("Return", (0, 0), xytext=(10, 10), textcoords="offset points",
                                          fontsize=8, fontweight="bold", zorder=4)
         self.feed_fps_text = ax.text(0.02, 0.97, "", transform=ax.transAxes, fontsize=10,
@@ -2142,23 +2332,17 @@ class DUVAutocollimatorGUI:
         grid is hidden over the live image so it doesn't hide the spot."""
         ax = self.cam_ax
         t = self.theme
-        metrology = self.mode == "Metrology"
-        self.feed_title_label.config(text="Live Camera Image (ROI)" if metrology
-                                     else "Source / Return Position (whole sensor)")
         ax.tick_params(left=True, bottom=True, labelleft=True, labelbottom=True,
-                       colors=t["plot_fg"], labelsize=7)
-        if metrology:
-            ax.grid(False)
-        else:
-            ax.grid(True, color=t["grid"], linewidth=0.5)
-        ax.set_xlabel("sensor x (px)", color=t["plot_fg"], fontsize=8)
-        ax.set_ylabel("sensor y (px)", color=t["plot_fg"], fontsize=8)
+                       colors=t["plot_fg"], labelsize=7 * self.text_scale)
+        ax.grid(False)          # no grid over the live image
+        ax.set_xlabel("sensor x (px)", color=t["plot_fg"], fontsize=8 * self.text_scale)
+        ax.set_ylabel("sensor y (px)", color=t["plot_fg"], fontsize=8 * self.text_scale)
 
     def _feed_view(self):
         """(center_x, center_y, half_size) of the square region shown:
         the ROI in Metrology, the whole sensor in Alignment. A
         non-square region is padded to a square around its center."""
-        if self.mode == "Metrology" and self.source is not None:
+        if self.source is not None:
             ox, oy = self.display_offset
             cx, cy = ox + self.frame_w / 2.0, oy + self.frame_h / 2.0
             half = max(self.frame_w, self.frame_h) / 2.0
@@ -2174,9 +2358,7 @@ class DUVAutocollimatorGUI:
     def _refresh_feed(self):
         t = self.theme
         ax = self.cam_ax
-        metrology = self.mode == "Metrology"
-
-        if metrology and self.last_display_frame is not None:
+        if self.last_display_frame is not None and self.source is not None:
             ox, oy = self.display_offset
             dh, dw = self.last_display_frame.shape[:2]
             s = self.display_step
@@ -2190,7 +2372,7 @@ class DUVAutocollimatorGUI:
         ox, oy = self.display_offset
         roi_smaller = self.source is not None and (self.frame_w < self.sensor_w or self.frame_h < self.sensor_h)
         self.feed_roi_rect.set_bounds(ox, oy, self.frame_w, self.frame_h)
-        self.feed_roi_rect.set_visible(roi_smaller and not metrology)
+        self.feed_roi_rect.set_visible(False)      # the view IS the ROI
 
         bx, by = self.bias_x, self.bias_y
         self.feed_hline.set_ydata([by, by])
@@ -2202,9 +2384,11 @@ class DUVAutocollimatorGUI:
         if has_ret:
             self.feed_ret.set_data([self.last_cx], [self.last_cy])
             self.feed_ret_text.xy = (self.last_cx, self.last_cy)
-            self.feed_conn.set_data([bx, self.last_cx], [by, self.last_cy])
-        for a in (self.feed_ret, self.feed_ret_text, self.feed_conn):
+            self.feed_ret_h.set_ydata([self.last_cy, self.last_cy])
+            self.feed_ret_v.set_xdata([self.last_cx, self.last_cx])
+        for a in (self.feed_ret, self.feed_ret_text, self.feed_ret_h, self.feed_ret_v):
             a.set_visible(has_ret)
+        self.feed_conn.set_visible(False)
 
         if self.source is None:
             self.feed_msg_text.set_text("No camera connected\nChoose a source on the Camera tab")
@@ -2244,6 +2428,8 @@ class DUVAutocollimatorGUI:
         self.feed_src.set_color(t["bad"])
         self.feed_src_text.set_color(t["bad"])
         self.feed_ret.set_markeredgecolor(t["ok"])
+        self.feed_ret_h.set_color(t["ok"])
+        self.feed_ret_v.set_color(t["ok"])
         self.feed_ret_text.set_color(t["ok"])
         self.feed_conn.set_color(t["marker"])
         self.feed_roi_rect.set_edgecolor(t["marker"])
@@ -2691,6 +2877,7 @@ class DUVAutocollimatorGUI:
             self._refresh_feed()
             return
         src.threshold_ratio = self._threshold_ratio()
+        src.display_max_px = METRO_DISPLAY_PX if self.mode == "Metrology" else DISPLAY_MAX_PX
         if src.is_simulator:
             if self.test_mode_var.get():
                 src.forced_pixel = (self.test_point_origin_x + self.test_az_field.get() / ARCSEC_PER_PIXEL_SIM,
@@ -2737,9 +2924,12 @@ class DUVAutocollimatorGUI:
         self.el_hist.append(self.last_el if self.last_el is not None else float("nan"))
 
         self._write_csv_row()
-        self._refresh_feed()
-        self._refresh_readouts()
-        self._refresh_charts()
+        if self.mode == "Metrology":
+            self._refresh_metro()            # only the big camera view is on screen
+        else:
+            self._refresh_feed()
+            self._refresh_readouts()
+            self._refresh_charts()
         self._update_tolerance_status()
 
         if self._recording and self._recording_mode == "frames":
@@ -2831,22 +3021,13 @@ class DUVAutocollimatorGUI:
             nd = self._decimals() + 1
             self.az_noise_box.value_label.config(text=f"{self._convert(az_rms):.{nd}f}")
             self.el_noise_box.value_label.config(text=f"{self._convert(el_rms):.{nd}f}")
-            self.metric_labels["repeatability"].config(text=f"{self._convert(2 * max(az_rms, el_rms)):.{nd}f} {u}")
+            self.repeat_box.value_label.config(text=f"{self._convert(2 * max(az_rms, el_rms)):.{nd}f}")
         else:
             self.az_noise_box.value_label.config(text="--")
             self.el_noise_box.value_label.config(text="--")
-            self.metric_labels["repeatability"].config(text="--")
-        m = self.metric_labels
-        m["centroid_px"].config(text=f"{self.last_cx:.2f}, {self.last_cy:.2f}" if self.last_cx is not None else "--")
-        m["bias_px"].config(text=f"{self.bias_x:.2f}, {self.bias_y:.2f}")
-        m["plate_scale"].config(text=f"{self._arcsec_per_px():.4f}")
-        m["spot_size"].config(text=f"{self.last_spot_px:.2f}" if self.last_spot_px is not None else "--")
-        m["peak_signal"].config(text=f"{self.last_peak_raw} / {self.last_background:.0f}  of {self.peak_max}"
-                                if self.source is not None else "--")
-        m["frame_rate"].config(text=f"{self.measured_fps:.2f}" if self.measured_fps > 0 else "--")
-        exp = self.exposure_actual_ms if self.exposure_actual_ms is not None else None
-        m["exposure_time"].config(text=f"{exp:.3f}" if exp is not None else "--")
-        m["temperature"].config(text=f"{self.temp_c:.1f}" if self.temp_c is not None else "--")
+            self.repeat_box.value_label.config(text="--")
+        self.spot_box.value_label.config(text=f"{self.last_spot_px:.1f}" if self.last_spot_px is not None
+                                         else "--")
 
     def _refresh_charts(self):
         xs = list(self.sample_index)
@@ -2863,17 +3044,18 @@ class DUVAutocollimatorGUI:
                 lo, hi = float(finite.min()), float(finite.max())
                 pad = max(0.001 if u == "mm" else 0.5, (hi - lo) * 0.2)
                 ax.set_ylim(lo - pad, hi + pad)
-            ax.set_ylabel(f"{name} ({u})", color=self.theme["plot_fg"], fontsize=8)
+            ax.set_ylabel(f"{name} ({u})", color=self.theme["plot_fg"], fontsize=8 * self.text_scale)
             canvas.draw_idle()
 
         last_az = self._convert(self.last_az)
         last_el = self._convert(self.last_el)
         if last_az is not None:
             self.xy_point.set_data([last_az], [last_el])
-            self.xy_connector.set_data([0, last_az], [0, last_el])
+            self.xy_ret_h.set_ydata([last_el, last_el])
+            self.xy_ret_v.set_xdata([last_az, last_az])
             self.xy_return_label.xy = (last_az, last_el)
         visible = last_az is not None
-        for a in (self.xy_point, self.xy_connector, self.xy_return_label):
+        for a in (self.xy_point, self.xy_ret_h, self.xy_ret_v, self.xy_return_label):
             a.set_visible(visible)
         half = self._convert((max(self.sensor_w, self.sensor_h) / 2.0) * self._arcsec_per_px())
         if half != getattr(self, "_xy_half_applied", None):
@@ -2883,8 +3065,8 @@ class DUVAutocollimatorGUI:
             self.xy_ax.xaxis.set_major_locator(ticks)
             self.xy_ax.yaxis.set_major_locator(FixedLocator(centered_ticks(-half, half, 0.0, target=6)))
             self._xy_half_applied = half
-        self.xy_ax.set_xlabel(f"Azimuth ({u})", color=self.theme["plot_fg"], fontsize=8)
-        self.xy_ax.set_ylabel(f"Elevation ({u})", color=self.theme["plot_fg"], fontsize=8)
+        self.xy_ax.set_xlabel(f"Azimuth ({u})", color=self.theme["plot_fg"], fontsize=8 * self.text_scale)
+        self.xy_ax.set_ylabel(f"Elevation ({u})", color=self.theme["plot_fg"], fontsize=8 * self.text_scale)
         self.xy_canvas.draw_idle()
 
     def _clear_charts(self):
@@ -3040,7 +3222,7 @@ class DUVAutocollimatorGUI:
             fig.set_facecolor(t["plot_bg"])
         for ax in (self.az_ax, self.el_ax, self.xy_ax):
             ax.set_facecolor(t["plot_bg"])
-            ax.tick_params(colors=t["plot_fg"], labelsize=7)
+            ax.tick_params(colors=t["plot_fg"], labelsize=7 * self.text_scale)
             for spine in ax.spines.values():
                 spine.set_color(t["plot_fg"])
             ax.grid(True, color=t["grid"], linewidth=0.6)
@@ -3048,7 +3230,10 @@ class DUVAutocollimatorGUI:
         self.el_line.set_color(t["plot_fg"])
         self.xy_point.set_color(t["ok"])
         self.xy_source_point.set_color(t["bad"])
-        self.xy_connector.set_color(t["marker"])
+        for a in (self.xy_src_h, self.xy_src_v):
+            a.set_color(t["bad"])
+        for a in (self.xy_ret_h, self.xy_ret_v):
+            a.set_color(t["ok"])
         self.xy_source_label.set_color(t["bad"])
         self.xy_return_label.set_color(t["ok"])
         self._apply_feed_colors()
@@ -3114,9 +3299,6 @@ class DUVAutocollimatorGUI:
             for key, sw in swatches.items():
                 new[key] = sw.cget("bg")
             THEMES["Custom"] = new
-            values = list(self.theme_combo["values"])
-            if "Custom" not in values:
-                self.theme_combo["values"] = values + ["Custom"]
             dialog.destroy()
             self._apply_theme("Custom")
 
@@ -3302,6 +3484,7 @@ class DUVAutocollimatorGUI:
         state = {
             "software_rev": SOFTWARE_REV,
             "theme": self.theme_name,
+            "text_size": self.text_size_var.get(),
             "custom_theme": THEMES.get("Custom"),
             "mode": self.mode,
             "source": self.source_var.get(),
@@ -3342,6 +3525,8 @@ class DUVAutocollimatorGUI:
                 self.theme_name = st["theme"]
                 self.theme = THEMES[self.theme_name]
                 self.theme_var.set(self.theme_name)
+            if st.get("text_size") in TEXT_SIZES:
+                self.text_size_var.set(st["text_size"])
             if st.get("mode") in MODES:
                 self.mode = st["mode"]
                 self.mode_var.set(self.mode)
