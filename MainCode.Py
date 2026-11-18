@@ -146,7 +146,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.6"
+SOFTWARE_REV = "B2.7"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -2279,15 +2279,31 @@ class DUVAutocollimatorGUI:
         if mode == "Metrology":
             self.outer.grid_remove()
             self.metro_frame.grid()
-            self.root.after_idle(self._refresh_metro)
         else:
             self.metro_frame.grid_remove()
             self.outer.grid()
-            self._refresh_readouts()
-            self._refresh_charts()
         self._configure_feed_axes()
         self._update_info_row()
-        self._refresh_feed()
+        # macOS Tk may not repaint a view that was just swapped in until the
+        # next mouse/keyboard event, so the new mode looked blank until the
+        # user clicked around. Finish the layout now and redraw explicitly,
+        # then once more after the window manager has caught up.
+        self.root.update_idletasks()
+        self._redraw_mode_view()
+        self.root.after(60, self._redraw_mode_view)
+        self.root.after(250, self._redraw_mode_view)
+
+    def _redraw_mode_view(self):
+        if self.mode == "Metrology":
+            self._refresh_metro()
+            self.metro_canvas.update_idletasks()
+        else:
+            self._refresh_feed()
+            self._refresh_readouts()
+            self._refresh_charts()
+            for canvas in (self.cam_canvas, self.az_canvas, self.el_canvas, self.xy_canvas):
+                canvas.draw()
+        self.root.update_idletasks()
 
     def _init_feed_artists(self):
         """Create every feed artist ONCE; each frame only updates them.
