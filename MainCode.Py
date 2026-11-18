@@ -146,7 +146,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.7"
+SOFTWARE_REV = "B2.9"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -1755,10 +1755,16 @@ class DUVAutocollimatorGUI:
         right.grid(row=0, column=2, sticky="nsew")
         for col in (left, middle, right):
             col.grid_propagate(False)
+        self.col_left, self.col_middle, self.col_right = left, middle, right
 
+        # The camera tabs and the Capture box are SHARED by both modes: they
+        # are children of `outer` and are placed into the Alignment columns
+        # or the Metrology sidebar (grid in_=...). One set of controls, so a
+        # setting changed in one mode is already set in the other.
         self._build_left(left)
         self._build_middle(middle)
         self._build_right(right)
+        self._place_shared("Alignment")
 
     # ---------------- LEFT: image/graph + camera tabs ----------------
 
@@ -1779,8 +1785,8 @@ class DUVAutocollimatorGUI:
         self._feed_layout = pin_square_axes(self.cam_fig, self.cam_ax, self._feed_margins)
 
         # tab chips
-        tabs = self._frame(parent)
-        tabs.grid(row=2, column=0, sticky="ew")
+        tabs = self._frame(self.outer)          # shared with Metrology (see _place_shared)
+        self.tabs_frame = tabs
         self.tab_chips = {}
         for name in ("Camera", "Settings", "Test Point"):
             chip = self._make_chip(tabs, name, self.tab_var, name, command=lambda n=name: self._show_tab(n))
@@ -1790,8 +1796,7 @@ class DUVAutocollimatorGUI:
         # page container: one fixed-height cell, all pages stacked in it.
         # Its height is set from the TALLEST page after building, so no
         # page can ever be cut off and switching never moves anything.
-        self.page_host = self._frame(parent, bd=1, relief=tk.GROOVE)
-        self.page_host.grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        self.page_host = self._frame(self.outer, bd=1, relief=tk.GROOVE)   # shared
         self.page_host.grid_columnconfigure(0, weight=1)
         self.page_host.grid_rowconfigure(0, weight=1)
         self.pages = {}
@@ -1880,8 +1885,9 @@ class DUVAutocollimatorGUI:
                                              on_commit=lambda v: self._update_plate_scale_label())
         self.focal_field.pack(side=tk.LEFT)
         self._label(r3, "mm").pack(side=tk.LEFT, padx=(3, 0))
-        self.plate_scale_label = self._label(r3, "", font=self.mono9, anchor="e")
-        self.plate_scale_label.pack(side=tk.RIGHT)
+        # plate scale on its own line so it never runs into "mm" at large text sizes
+        self.plate_scale_label = self._label(r3, "", font=self.mono9, anchor="w")
+        self.plate_scale_label.pack(side=tk.LEFT, padx=(10, 0))
 
         r4 = self._frame(page)
         r4.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 0), padx=4)
@@ -2021,8 +2027,8 @@ class DUVAutocollimatorGUI:
         self.xy_ax.xaxis.set_major_formatter(FuncFormatter(tick_label))
         self.xy_ax.yaxis.set_major_formatter(FuncFormatter(tick_label))
 
-        cap = self._labelframe(parent, "Capture")
-        cap.grid(row=1, column=0, sticky="ew", pady=(6, 3))
+        cap = self._labelframe(self.outer, "Capture")     # shared with Metrology
+        self.capture_frame = cap
         cap.grid_columnconfigure(0, weight=1)
         path_row = self._frame(cap)
         path_row.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 2))
@@ -2166,8 +2172,16 @@ class DUVAutocollimatorGUI:
     def _build_metrology_view(self):
         """Metrology mode: just the live camera feed, as large as the
         window allows (aspect kept), with fps / size / saturation text."""
-        self.metro_frame = tk.Frame(self.root, bg="black")
-        self.metro_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        # Created BEFORE the columns and the shared controls, so those stack
+        # above it. Feed spans the left two columns; sidebar = right column.
+        self.metro_frame = tk.Frame(self.outer, bg="black")
+        self.metro_frame.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 8))
+        self.metro_side = self._frame(self.outer)
+        self.metro_side.grid(row=0, column=2, sticky="nsew")
+        self.metro_side.grid_propagate(False)
+        self.metro_side.grid_columnconfigure(0, weight=1)
+        self.metro_side.grid_rowconfigure(3, weight=1)
+        self.metro_side.grid_remove()
         self.metro_canvas = tk.Canvas(self.metro_frame, bg="black", highlightthickness=0)
         self.metro_canvas.pack(fill=tk.BOTH, expand=True)
         c = self.metro_canvas
@@ -2177,6 +2191,20 @@ class DUVAutocollimatorGUI:
         self._metro_sat = c.create_text(0, 0, anchor="s", fill="#ff4040", font=("Arial", 14, "bold"))
         c.bind("<Configure>", lambda e: self._refresh_metro())
         self.metro_frame.grid_remove()
+
+    def _place_shared(self, mode):
+        """Put the camera tabs, settings pages and Capture box into the
+        Alignment columns or the Metrology sidebar."""
+        if mode == "Metrology":
+            self.tabs_frame.grid(in_=self.metro_side, row=0, column=0, sticky="ew")
+            self.page_host.grid(in_=self.metro_side, row=1, column=0, sticky="ew", pady=(3, 0))
+            self.capture_frame.grid(in_=self.metro_side, row=2, column=0, sticky="ew", pady=(10, 3))
+        else:
+            self.tabs_frame.grid(in_=self.col_left, row=2, column=0, sticky="ew")
+            self.page_host.grid(in_=self.col_left, row=3, column=0, sticky="ew", pady=(3, 0))
+            self.capture_frame.grid(in_=self.col_right, row=1, column=0, sticky="ew", pady=(6, 3))
+        for w in (self.tabs_frame, self.page_host, self.capture_frame):
+            w.lift()
 
     def _refresh_metro(self):
         if self.mode != "Metrology" or not hasattr(self, "metro_canvas"):
@@ -2277,11 +2305,16 @@ class DUVAutocollimatorGUI:
         if self.source is not None:
             self.source.display_max_px = METRO_DISPLAY_PX if mode == "Metrology" else DISPLAY_MAX_PX
         if mode == "Metrology":
-            self.outer.grid_remove()
+            for col in (self.col_left, self.col_middle, self.col_right):
+                col.grid_remove()
             self.metro_frame.grid()
+            self.metro_side.grid()
         else:
             self.metro_frame.grid_remove()
-            self.outer.grid()
+            self.metro_side.grid_remove()
+            for col in (self.col_left, self.col_middle, self.col_right):
+                col.grid()
+        self._place_shared(mode)
         self._configure_feed_axes()
         self._update_info_row()
         # macOS Tk may not repaint a view that was just swapped in until the
@@ -2296,14 +2329,32 @@ class DUVAutocollimatorGUI:
     def _redraw_mode_view(self):
         if self.mode == "Metrology":
             self._refresh_metro()
-            self.metro_canvas.update_idletasks()
         else:
             self._refresh_feed()
             self._refresh_readouts()
             self._refresh_charts()
             for canvas in (self.cam_canvas, self.az_canvas, self.el_canvas, self.xy_canvas):
                 canvas.draw()
-        self.root.update_idletasks()
+        self._force_repaint()
+
+    def _force_repaint(self):
+        """macOS only puts Tk's drawing on screen when the Cocoa event loop
+        runs; after a view swap that can wait for the next mouse/keyboard
+        event (the new mode looked blank until the user clicked around).
+        update() runs that loop, and a tiny change in window opacity makes
+        the window server repaint the whole window immediately."""
+        try:
+            self.root.update()
+        except tk.TclError:
+            return
+        if platform.system() == "Darwin":
+            try:
+                self.root.attributes("-alpha", 0.995)
+                self.root.update()
+                self.root.attributes("-alpha", 1.0)
+                self.root.update()
+            except tk.TclError:
+                pass
 
     def _init_feed_artists(self):
         """Create every feed artist ONCE; each frame only updates them.
@@ -2772,7 +2823,7 @@ class DUVAutocollimatorGUI:
         return self._metrology_arcsec_per_px()
 
     def _update_plate_scale_label(self):
-        self.plate_scale_label.config(text=f"= {self._arcsec_per_px():.4f} arc-sec/px")
+        self.plate_scale_label.config(text=f"→ {self._arcsec_per_px():.3f}\"/px")
         self._refresh_readouts()
 
     def _current_cal_key(self):
