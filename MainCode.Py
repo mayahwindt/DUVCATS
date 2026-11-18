@@ -146,7 +146,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.9"
+SOFTWARE_REV = "B2.10"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -1733,43 +1733,71 @@ class DUVAutocollimatorGUI:
         self.system_name_var.trace_add("write", lambda *a: self._update_system_label())
         self._build_profile_window()
 
-        # row 2: three columns (Alignment) or the big camera view (Metrology)
+        # row 2: the window body, in two bands that share the same three
+        # column widths:
+        #   views band (top)     - Alignment: spot image | readout + charts | X-Y plot
+        #                          Metrology: the big camera feed across all three
+        #   controls band (bottom) - camera tabs | measurement numbers | capture + buttons
+        # Switching modes only changes the top band, so every control stays
+        # exactly where it is. The two top views are STACKED in one cell and
+        # switched with tkraise (like the Camera/Settings tabs): nothing is
+        # removed from the window, which macOS sometimes failed to repaint.
         outer = self._frame(self.root)
         outer.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
         self.outer = outer
-        self._build_metrology_view()
+        outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(0, weight=1)
-        # Column widths are a FIXED share of the window (uniform group +
-        # weights) and the column frames don't propagate their contents'
-        # size. So no label text, status message, mode or camera source
-        # can ever widen/narrow a column and shove the plots around.
-        outer.grid_columnconfigure(0, weight=10, minsize=360, uniform="cols")
-        outer.grid_columnconfigure(1, weight=9, minsize=300, uniform="cols")
-        outer.grid_columnconfigure(2, weight=11, minsize=340, uniform="cols")
 
-        left = self._frame(outer)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        middle = self._frame(outer)
-        middle.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
-        right = self._frame(outer)
-        right.grid(row=0, column=2, sticky="nsew")
-        for col in (left, middle, right):
-            col.grid_propagate(False)
-        self.col_left, self.col_middle, self.col_right = left, middle, right
+        stage = self._frame(outer)
+        stage.grid(row=0, column=0, sticky="nsew")
+        stage.grid_rowconfigure(0, weight=1)
+        stage.grid_columnconfigure(0, weight=1)
+        self.align_view = self._frame(stage)
+        self.align_view.grid(row=0, column=0, sticky="nsew")
+        self._build_metrology_view(stage)          # stacked in the same cell
 
-        # The camera tabs and the Capture box are SHARED by both modes: they
-        # are children of `outer` and are placed into the Alignment columns
-        # or the Metrology sidebar (grid in_=...). One set of controls, so a
-        # setting changed in one mode is already set in the other.
-        self._build_left(left)
-        self._build_middle(middle)
-        self._build_right(right)
-        self._place_shared("Alignment")
+        band = self._frame(outer)
+        band.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.band = band
+
+        tops = self._three_columns(self.align_view)
+        bots = self._three_columns(band)
+        self.band_cols = bots
+        self._build_left(tops[0], bots[0])
+        self._build_middle(tops[1], bots[1])
+        self._build_right(tops[2], bots[2])
+        self._size_band()
+
+    def _three_columns(self, parent):
+        """Three column frames at FIXED proportions (uniform group +
+        weights, contents don't propagate), identical in both bands, so the
+        bands line up and nothing inside can resize a column."""
+        parent.grid_rowconfigure(0, weight=1)
+        for c, (w, mn) in enumerate(((10, 360), (9, 300), (11, 340))):
+            parent.grid_columnconfigure(c, weight=w, minsize=mn, uniform="cols")
+        cols = []
+        for c in range(3):
+            f = self._frame(parent)
+            f.grid(row=0, column=c, sticky="nsew", padx=(0, 8) if c < 2 else 0)
+            f.grid_columnconfigure(0, weight=1)
+            cols.append(f)
+        return cols
+
+    def _size_band(self):
+        """Controls band height = its tallest column's natural height."""
+        for f in self.band_cols:
+            f.grid_propagate(True)
+        self.band.update_idletasks()
+        h = max(f.winfo_reqheight() for f in self.band_cols)
+        for f in self.band_cols:
+            f.grid_propagate(False)
+            f.configure(height=h)
+        for f in self.align_view.winfo_children():
+            f.grid_propagate(False)
 
     # ---------------- LEFT: image/graph + camera tabs ----------------
 
-    def _build_left(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
+    def _build_left(self, parent, bot):
         parent.grid_rowconfigure(1, weight=1)
 
         self.feed_title_label = self._label(parent, "Live Spot Image", font=("Arial", 12, "bold"),
@@ -1779,13 +1807,14 @@ class DUVAutocollimatorGUI:
         self.cam_fig = Figure(figsize=(4.4, 4.4), dpi=90)
         self.cam_ax = self.cam_fig.add_axes([0.13, 0.10, 0.84, 0.86])
         self.cam_canvas, cam_widget = self._make_canvas(self.cam_fig, parent, 380, 200)
-        cam_widget.grid(row=1, column=0, sticky="nsew", pady=(2, 6))
+        cam_widget.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
         self._init_feed_artists()
-        # identical square plot box in every mode and for every source
+        # identical square plot box for every source
         self._feed_layout = pin_square_axes(self.cam_fig, self.cam_ax, self._feed_margins)
 
-        # tab chips
-        tabs = self._frame(self.outer)          # shared with Metrology (see _place_shared)
+        # camera tabs (controls band, same place in both modes)
+        tabs = self._frame(bot)
+        tabs.grid(row=0, column=0, sticky="ew")
         self.tabs_frame = tabs
         self.tab_chips = {}
         for name in ("Camera", "Settings", "Test Point"):
@@ -1796,7 +1825,8 @@ class DUVAutocollimatorGUI:
         # page container: one fixed-height cell, all pages stacked in it.
         # Its height is set from the TALLEST page after building, so no
         # page can ever be cut off and switching never moves anything.
-        self.page_host = self._frame(self.outer, bd=1, relief=tk.GROOVE)   # shared
+        self.page_host = self._frame(bot, bd=1, relief=tk.GROOVE)
+        self.page_host.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         self.page_host.grid_columnconfigure(0, weight=1)
         self.page_host.grid_rowconfigure(0, weight=1)
         self.pages = {}
@@ -1911,10 +1941,9 @@ class DUVAutocollimatorGUI:
 
     # ---------------- MIDDLE: readout, stats, strip charts ----------------
 
-    def _build_middle(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(5, weight=1)
-        parent.grid_rowconfigure(6, weight=1)
+    def _build_middle(self, parent, bot):
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
 
         # AZ/EL readout. Colored by tolerance status, not by theme. The
         # digits' font size is fitted to the available width (see
@@ -1937,21 +1966,21 @@ class DUVAutocollimatorGUI:
         self.el_label.grid(row=1, column=1, sticky="ew")
         self.readout_frame.bind("<Configure>", self._fit_readout)
 
-        cal = self._frame(parent)
-        cal.grid(row=1, column=0, sticky="ew", pady=(0, 2))
+        cal = self._frame(bot)
+        cal.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         self.cal_status_label = tk.Label(cal, text="", font=("Arial", 10, "bold"))
         self.cal_status_label.pack(side=tk.LEFT)
         self._make_button(cal, "Set Calibrated Zero", self._set_zero).pack(side=tk.RIGHT)
 
-        tol = self._frame(parent)
-        tol.grid(row=2, column=0, sticky="ew", pady=(2, 6))
+        tol = self._frame(bot)
+        tol.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         self._label(tol, "Tolerance (arc-sec):", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         self.tolerance_field = self._make_number(tol, 5.0, 0.1, 10000, 0.5, 1, width=7,
                                                  on_commit=lambda v: self._update_tolerance_status())
         self.tolerance_field.pack(side=tk.LEFT, padx=(6, 0))
 
-        row1 = self._frame(parent)
-        row1.grid(row=3, column=0, sticky="ew", pady=2)
+        row1 = self._frame(bot)
+        row1.grid(row=2, column=0, sticky="ew", pady=2)
         for c in range(3):
             row1.grid_columnconfigure(c, weight=1, uniform="stats1")
         self.signal_box = self._stat_box(row1, "Signal (%)", 0)
@@ -1963,8 +1992,8 @@ class DUVAutocollimatorGUI:
         units_dd.pack(pady=(0, 4))
         units_dd.bind("<<ComboboxSelected>>", lambda e: (self._refresh_readouts(), self._refresh_charts()))
 
-        row2 = self._frame(parent)
-        row2.grid(row=4, column=0, sticky="ew", pady=2)
+        row2 = self._frame(bot)
+        row2.grid(row=3, column=0, sticky="ew", pady=2)
         for c in range(3):
             row2.grid_columnconfigure(c, weight=1, uniform="stats2")
         self.az_noise_box = self._stat_box(row2, "AZ Noise (RMS)", 0)
@@ -1974,16 +2003,16 @@ class DUVAutocollimatorGUI:
         self.az_fig = Figure(figsize=(3.9, 2.2), dpi=90)
         self.az_ax = self.az_fig.add_axes([0.20, 0.16, 0.76, 0.78])
         self.az_canvas, w = self._make_canvas(self.az_fig, parent, 300, 110)
-        w.grid(row=5, column=0, sticky="nsew", pady=(6, 2))
+        w.grid(row=1, column=0, sticky="nsew", pady=(6, 2))
         (self.az_line,) = self.az_ax.plot([], [], linewidth=0.9)
 
         self.el_fig = Figure(figsize=(3.9, 2.2), dpi=90)
         self.el_ax = self.el_fig.add_axes([0.20, 0.16, 0.76, 0.78])
         self.el_canvas, w = self._make_canvas(self.el_fig, parent, 300, 110)
-        w.grid(row=6, column=0, sticky="nsew", pady=(2, 2))
+        w.grid(row=2, column=0, sticky="nsew", pady=(2, 2))
         (self.el_line,) = self.el_ax.plot([], [], linewidth=0.9)
 
-        self._make_button(parent, "Clear Charts", self._clear_charts).grid(row=7, column=0, pady=(4, 0))
+        self._make_button(parent, "Clear Charts", self._clear_charts).grid(row=3, column=0, pady=(4, 0))
 
     def _stat_box(self, parent, title, col):
         box = self._frame(parent, highlightthickness=1)
@@ -1996,8 +2025,7 @@ class DUVAutocollimatorGUI:
 
     # ---------------- RIGHT: X-Y plot, metrics, capture, controls ----------------
 
-    def _build_right(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
+    def _build_right(self, parent, bot):
         parent.grid_rowconfigure(0, weight=1)
 
         xy = self._frame(parent)
@@ -2027,7 +2055,8 @@ class DUVAutocollimatorGUI:
         self.xy_ax.xaxis.set_major_formatter(FuncFormatter(tick_label))
         self.xy_ax.yaxis.set_major_formatter(FuncFormatter(tick_label))
 
-        cap = self._labelframe(self.outer, "Capture")     # shared with Metrology
+        cap = self._labelframe(bot, "Capture")      # controls band, same place in both modes
+        cap.grid(row=0, column=0, sticky="ew")
         self.capture_frame = cap
         cap.grid_columnconfigure(0, weight=1)
         path_row = self._frame(cap)
@@ -2062,8 +2091,8 @@ class DUVAutocollimatorGUI:
 
         # grid (not pack): the port column gives up width first, so the
         # Restart / Pause / Exit buttons always keep their full size
-        ctrl = self._frame(parent)
-        ctrl.grid(row=2, column=0, sticky="ew", pady=(6, 3))
+        ctrl = self._frame(bot)
+        ctrl.grid(row=1, column=0, sticky="ew", pady=(6, 3))
         ctrl.grid_columnconfigure(0, weight=1)
         # (the reserved Instrument Port selector is in the ☰ menu)
         self._make_button(ctrl, "Restart", self._restart, width=7).grid(row=0, column=1, padx=(6, 0))
@@ -2074,10 +2103,10 @@ class DUVAutocollimatorGUI:
 
         # instrument info: wraps, but always INFO_LINES tall so a longer
         # text (mode/sensor name) can't change the X-Y plot's height
-        self.info_label = self._label(parent, "", role="readout", relief=tk.SUNKEN, font=("Arial", 9),
+        self.info_label = self._label(bot, "", role="readout", relief=tk.SUNKEN, font=("Arial", 9),
                                       anchor="nw", justify="left", padx=4, pady=2, width=1,
                                       height=INFO_LINES)
-        self.info_label.grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        self.info_label.grid(row=2, column=0, sticky="ew", pady=(3, 0))
         self.info_label.bind("<Configure>", lambda e: self.info_label.configure(wraplength=max(100, e.width - 10)))
 
 
@@ -2169,19 +2198,12 @@ class DUVAutocollimatorGUI:
         name = self.system_name_var.get().strip()
         self.system_label.config(text=f"System: {name}" if name else "System: none  (☰ › System Profiles)")
 
-    def _build_metrology_view(self):
-        """Metrology mode: just the live camera feed, as large as the
-        window allows (aspect kept), with fps / size / saturation text."""
-        # Created BEFORE the columns and the shared controls, so those stack
-        # above it. Feed spans the left two columns; sidebar = right column.
-        self.metro_frame = tk.Frame(self.outer, bg="black")
-        self.metro_frame.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 8))
-        self.metro_side = self._frame(self.outer)
-        self.metro_side.grid(row=0, column=2, sticky="nsew")
-        self.metro_side.grid_propagate(False)
-        self.metro_side.grid_columnconfigure(0, weight=1)
-        self.metro_side.grid_rowconfigure(3, weight=1)
-        self.metro_side.grid_remove()
+    def _build_metrology_view(self, stage):
+        """Metrology mode: the live camera feed, as large as the views band
+        allows (aspect kept), with fps / size / saturation text. Stacked
+        under the Alignment views; _set_mode raises one or the other."""
+        self.metro_frame = tk.Frame(stage, bg="black")
+        self.metro_frame.grid(row=0, column=0, sticky="nsew")
         self.metro_canvas = tk.Canvas(self.metro_frame, bg="black", highlightthickness=0)
         self.metro_canvas.pack(fill=tk.BOTH, expand=True)
         c = self.metro_canvas
@@ -2190,21 +2212,6 @@ class DUVAutocollimatorGUI:
         self._metro_msg = c.create_text(0, 0, anchor="center", fill="#cccccc", font=("Arial", 14))
         self._metro_sat = c.create_text(0, 0, anchor="s", fill="#ff4040", font=("Arial", 14, "bold"))
         c.bind("<Configure>", lambda e: self._refresh_metro())
-        self.metro_frame.grid_remove()
-
-    def _place_shared(self, mode):
-        """Put the camera tabs, settings pages and Capture box into the
-        Alignment columns or the Metrology sidebar."""
-        if mode == "Metrology":
-            self.tabs_frame.grid(in_=self.metro_side, row=0, column=0, sticky="ew")
-            self.page_host.grid(in_=self.metro_side, row=1, column=0, sticky="ew", pady=(3, 0))
-            self.capture_frame.grid(in_=self.metro_side, row=2, column=0, sticky="ew", pady=(10, 3))
-        else:
-            self.tabs_frame.grid(in_=self.col_left, row=2, column=0, sticky="ew")
-            self.page_host.grid(in_=self.col_left, row=3, column=0, sticky="ew", pady=(3, 0))
-            self.capture_frame.grid(in_=self.col_right, row=1, column=0, sticky="ew", pady=(6, 3))
-        for w in (self.tabs_frame, self.page_host, self.capture_frame):
-            w.lift()
 
     def _refresh_metro(self):
         if self.mode != "Metrology" or not hasattr(self, "metro_canvas"):
@@ -2284,6 +2291,7 @@ class DUVAutocollimatorGUI:
         self.page_host.update_idletasks()
         tallest = max(p.winfo_reqheight() for p in self.pages.values())
         self.page_host.configure(height=tallest + 16)
+        self._size_band()
         self._configure_feed_axes()
         self._apply_theme(self.theme_name)
 
@@ -2304,17 +2312,8 @@ class DUVAutocollimatorGUI:
         self.mode_var.set(mode)
         if self.source is not None:
             self.source.display_max_px = METRO_DISPLAY_PX if mode == "Metrology" else DISPLAY_MAX_PX
-        if mode == "Metrology":
-            for col in (self.col_left, self.col_middle, self.col_right):
-                col.grid_remove()
-            self.metro_frame.grid()
-            self.metro_side.grid()
-        else:
-            self.metro_frame.grid_remove()
-            self.metro_side.grid_remove()
-            for col in (self.col_left, self.col_middle, self.col_right):
-                col.grid()
-        self._place_shared(mode)
+        # raise one stacked view over the other (no layout change at all)
+        (self.metro_frame if mode == "Metrology" else self.align_view).tkraise()
         self._configure_feed_axes()
         self._update_info_row()
         # macOS Tk may not repaint a view that was just swapped in until the
@@ -2338,23 +2337,12 @@ class DUVAutocollimatorGUI:
         self._force_repaint()
 
     def _force_repaint(self):
-        """macOS only puts Tk's drawing on screen when the Cocoa event loop
-        runs; after a view swap that can wait for the next mouse/keyboard
-        event (the new mode looked blank until the user clicked around).
-        update() runs that loop, and a tiny change in window opacity makes
-        the window server repaint the whole window immediately."""
+        """Process pending drawing now (no window tricks: changing the
+        window opacity left the Alignment view blank on macOS)."""
         try:
-            self.root.update()
+            self.root.update_idletasks()
         except tk.TclError:
-            return
-        if platform.system() == "Darwin":
-            try:
-                self.root.attributes("-alpha", 0.995)
-                self.root.update()
-                self.root.attributes("-alpha", 1.0)
-                self.root.update()
-            except tk.TclError:
-                pass
+            pass
 
     def _init_feed_artists(self):
         """Create every feed artist ONCE; each frame only updates them.
@@ -2991,11 +2979,11 @@ class DUVAutocollimatorGUI:
         self.el_hist.append(self.last_el if self.last_el is not None else float("nan"))
 
         self._write_csv_row()
+        self._refresh_readouts()             # numbers in the controls band: both modes
         if self.mode == "Metrology":
-            self._refresh_metro()            # only the big camera view is on screen
+            self._refresh_metro()
         else:
             self._refresh_feed()
-            self._refresh_readouts()
             self._refresh_charts()
         self._update_tolerance_status()
 
