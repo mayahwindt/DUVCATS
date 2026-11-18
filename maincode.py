@@ -146,7 +146,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.10"
+SOFTWARE_REV = "B2.11"
 
 # ----------------------------------------------------------------------
 # Configuration
