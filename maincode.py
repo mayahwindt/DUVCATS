@@ -24,7 +24,9 @@ What the software does
   (factor of 2: a mirror tilt of theta deflects the return by 2*theta).
 - Metrology statistics: RMS noise, 2-sigma repeatability, signal level,
   saturation detection, spot size (focus aid), sensor temperature.
-- Tolerance alert (green/red readout + soft chime on change).
+- Tolerance alert (green/red readout + a sound on change; ☰ › Sound
+  picks the sound and volume, mutes it, or turns off the back-in-
+  tolerance sound).
 - Capture: window screenshot, short screen recording, raw full-resolution
   frame (16-bit TIFF), and CSV data logging.
 - Saved system profiles (persist across restarts), including each
@@ -146,7 +148,7 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SOFTWARE_REV = "B2.11"
+SOFTWARE_REV = "B2.13"
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -197,7 +199,14 @@ GAIN_MAX_DB = 24.0
 BLACK_LEVEL_MAX = 255.0
 FRAME_RATE_DEFAULT = 10.0
 
-METRO_DISPLAY_PX = 1600          # Metrology mode: larger live image for the big view
+METRO_DISPLAY_PX = 1600
+METRO_ZOOM_MAX = 32.0            # Metrology zoom limit (32x = individual pixels clearly visible)
+METRO_ZOOM_STEP = 1.25           # per scroll notch / button press
+
+# Tolerance alert sounds (☰ › Sound). Each has an "out of tolerance" and a
+# higher/rising "back in tolerance" version.
+ALERT_SOUNDS = ["Soft Chime", "Beep", "Double Beep", "Low Tone", "Alarm"]
+ALERT_VOLUMES = {"Low": 0.12, "Medium": 0.25, "High": 0.45, "Max": 0.70}   # peak amplitude          # Metrology mode: larger live image for the big view
 TEXT_SIZES = {"Small": 0.85, "Normal": 1.0, "Large": 1.2, "Extra Large": 1.4}
 DISPLAY_MAX_PX = 500             # live image is block-averaged to ~this size for DISPLAY only
 CHART_HISTORY = 300
@@ -1529,6 +1538,15 @@ class DUVAutocollimatorGUI:
         self._feed_margins = list(FEED_MARGINS)
         self._xy_margins = list(XY_MARGINS)
         self._metro_photo = None
+        self.sound_var = tk.StringVar(value="Soft Chime")
+        self.volume_var = tk.StringVar(value="Medium")
+        self.mute_var = tk.BooleanVar(value=False)
+        self.return_chime_var = tk.BooleanVar(value=True)     # sound when back in tolerance
+        self._zoom_slider_busy = False
+        self.metro_zoom = 1.0            # 1 = whole frame fits the window
+        self.metro_center = None         # frame pixel at the middle of the view
+        self._metro_frame_shape = None
+        self._metro_drag = None
         self.serial_ports = list_serial_ports()
         self.com_var = tk.StringVar(value=self.serial_ports[0])
         self.theme_var = tk.StringVar(value=self.theme_name)
@@ -1616,6 +1634,7 @@ class DUVAutocollimatorGUI:
         self._reset_measurement()
         self._update_cal_label()
         self._update_system_label()
+        self._update_mute_label()
         self._apply_text_size(self.text_size_var.get())
         self._set_mode(self.mode)
 
@@ -1730,6 +1749,11 @@ class DUVAutocollimatorGUI:
                 side=tk.LEFT, padx=(0, 4))
         self.system_label = self._label(top, "", font=("Arial", 10, "bold"), anchor="e")
         self.system_label.pack(side=tk.RIGHT)
+        # shown only while the alert sound is muted (click to unmute)
+        self.mute_label = self._label(top, "", font=("Arial", 10, "bold"), anchor="e", cursor="hand2")
+        self.mute_label.pack(side=tk.RIGHT, padx=(0, 18))
+        self.mute_label.bind("<Button-1>", lambda e: self.mute_var.set(False))
+        self.mute_var.trace_add("write", lambda *a: self._update_mute_label())
         self.system_name_var.trace_add("write", lambda *a: self._update_system_label())
         self._build_profile_window()
 
@@ -2129,6 +2153,20 @@ class DUVAutocollimatorGUI:
             size_m.add_radiobutton(label=name, variable=self.text_size_var, value=name,
                                    command=lambda n=name: self._apply_text_size(n))
         menu.add_cascade(label="Text Size", menu=size_m)
+        snd_m = tk.Menu(menu, tearoff=0)
+        snd_m.add_checkbutton(label="Mute", variable=self.mute_var, command=self._update_mute_label)
+        snd_m.add_separator()
+        for name in ALERT_SOUNDS:
+            snd_m.add_radiobutton(label=name, variable=self.sound_var, value=name,
+                                  command=lambda: self._play_alert(False, test=True))
+        snd_m.add_separator()
+        for name in ALERT_VOLUMES:
+            snd_m.add_radiobutton(label=f"Volume: {name}", variable=self.volume_var, value=name,
+                                  command=lambda: self._play_alert(False, test=True))
+        snd_m.add_separator()
+        snd_m.add_checkbutton(label="Also play when back in tolerance", variable=self.return_chime_var)
+        snd_m.add_command(label="Play Test Sound", command=lambda: self._play_alert(False, test=True))
+        menu.add_cascade(label="Sound", menu=snd_m)
         menu.add_separator()
         menu.add_command(label="System Profiles…", command=self._show_profile_window)
         rate_m = tk.Menu(menu, tearoff=0)
@@ -2211,18 +2249,162 @@ class DUVAutocollimatorGUI:
         self._metro_info = c.create_text(12, 10, anchor="nw", fill="#ffbf00", font=(self.mono, 12, "bold"))
         self._metro_msg = c.create_text(0, 0, anchor="center", fill="#cccccc", font=("Arial", 14))
         self._metro_sat = c.create_text(0, 0, anchor="s", fill="#ff4040", font=("Arial", 14, "bold"))
+        self._metro_hint = c.create_text(12, 0, anchor="sw", fill="#bbbbbb", font=("Arial", 10),
+                                         text="Scroll, slider or +/− to zoom · drag to move · double-click to fit")
+        # zoom buttons, top-right of the image
+        zbar = tk.Frame(c, bg="black")
+        self._make_button(zbar, "−", lambda: self._metro_zoom_by(1 / METRO_ZOOM_STEP),
+                          font=("Arial", 13, "bold")).pack(side=tk.LEFT)
+        self._make_button(zbar, "+", lambda: self._metro_zoom_by(METRO_ZOOM_STEP),
+                          font=("Arial", 13, "bold")).pack(side=tk.LEFT, padx=(4, 0))
+        self._make_button(zbar, "Fit", self._metro_zoom_fit, font=("Arial", 11, "bold")).pack(
+            side=tk.LEFT, padx=(4, 0))
+        # zoom slider (log scale: 0 = fit, 100 = METRO_ZOOM_MAX)
+        self.zoom_slider_var = tk.DoubleVar(value=0.0)
+        self.zoom_slider = tk.Scale(zbar, from_=0, to=100, orient=tk.HORIZONTAL, length=180, showvalue=False,
+                                    variable=self.zoom_slider_var, command=self._metro_zoom_from_slider,
+                                    bg="black", fg="#dddddd", troughcolor="#444444", highlightthickness=0,
+                                    sliderlength=18, bd=0)
+        self.zoom_slider.pack(side=tk.LEFT, before=zbar.winfo_children()[0], padx=(0, 8))
+        tk.Label(zbar, text="Zoom", bg="black", fg="#dddddd", font=("Arial", 10, "bold")).pack(
+            side=tk.LEFT, before=self.zoom_slider, padx=(0, 4))
+        self._metro_zbar = c.create_window(0, 10, anchor="ne", window=zbar)
         c.bind("<Configure>", lambda e: self._refresh_metro())
+        # mouse: wheel / trackpad scroll zooms at the pointer, drag pans,
+        # double-click fits (Button-4/5 = Linux wheel)
+        c.bind("<MouseWheel>", lambda e: self._metro_zoom_by(
+            METRO_ZOOM_STEP if e.delta > 0 else 1 / METRO_ZOOM_STEP, e.x, e.y))
+        c.bind("<Button-4>", lambda e: self._metro_zoom_by(METRO_ZOOM_STEP, e.x, e.y))
+        c.bind("<Button-5>", lambda e: self._metro_zoom_by(1 / METRO_ZOOM_STEP, e.x, e.y))
+        c.bind("<ButtonPress-1>", self._metro_drag_start)
+        c.bind("<B1-Motion>", self._metro_drag_move)
+        c.bind("<ButtonRelease-1>", lambda e: setattr(self, "_metro_drag", None))
+        c.bind("<Double-Button-1>", lambda e: self._metro_zoom_fit())
+
+    # ---- Metrology zoom / pan ----
+
+    def _metro_geometry(self):
+        """(canvas w, canvas h, frame w, frame h, screen px per frame px)."""
+        c = self.metro_canvas
+        cw, ch = max(1, c.winfo_width()), max(1, c.winfo_height())
+        if not self._metro_frame_shape:
+            return cw, ch, None, None, None
+        fh, fw = self._metro_frame_shape
+        fit = min(cw / float(fw), ch / float(fh))
+        return cw, ch, fw, fh, fit * self.metro_zoom
+
+    def _metro_clamp_center(self):
+        cw, ch, fw, fh, scale = self._metro_geometry()
+        if fw is None:
+            return
+        cx, cy = self.metro_center or (fw / 2.0, fh / 2.0)
+        half_w, half_h = cw / scale / 2.0, ch / scale / 2.0
+        # Image larger than the window: the view stays on the image.
+        # Image smaller: it may sit anywhere fully inside the window (so
+        # scroll-zoom keeps the point under the pointer still).
+        def clamp(c, half, size):
+            lo, hi = (half, size - half) if half < size / 2.0 else (size - half, half)
+            return min(max(c, lo), hi)
+        cx, cy = clamp(cx, half_w, fw), clamp(cy, half_h, fh)
+        self.metro_center = (cx, cy)
+
+    def _metro_zoom_by(self, factor, mx=None, my=None):
+        cw, ch, fw, fh, scale = self._metro_geometry()
+        if fw is None:
+            return
+        new_zoom = min(METRO_ZOOM_MAX, max(1.0, self.metro_zoom * factor))
+        if new_zoom == self.metro_zoom:
+            return
+        cx, cy = self.metro_center or (fw / 2.0, fh / 2.0)
+        mx = cw / 2.0 if mx is None else mx
+        my = ch / 2.0 if my is None else my
+        # keep the frame point under the pointer fixed while zooming
+        px, py = cx + (mx - cw / 2.0) / scale, cy + (my - ch / 2.0) / scale
+        self.metro_zoom = new_zoom
+        new_scale = self._metro_geometry()[4]
+        self.metro_center = (px - (mx - cw / 2.0) / new_scale, py - (my - ch / 2.0) / new_scale)
+        self._metro_clamp_center()
+        self._refresh_metro()
+
+    def _metro_zoom_from_slider(self, value):
+        if self._zoom_slider_busy:
+            return
+        target = METRO_ZOOM_MAX ** (float(value) / 100.0)
+        if abs(target - self.metro_zoom) > 1e-3:
+            self._metro_zoom_by(target / self.metro_zoom)      # zooms about the view center
+
+    def _sync_zoom_slider(self):
+        v = 100.0 * math.log(max(1.0, self.metro_zoom)) / math.log(METRO_ZOOM_MAX)
+        if abs(self.zoom_slider_var.get() - v) > 0.5:
+            self._zoom_slider_busy = True
+            try:
+                self.zoom_slider_var.set(v)
+            finally:
+                self._zoom_slider_busy = False
+
+    def _metro_zoom_fit(self):
+        self.metro_zoom = 1.0
+        self.metro_center = None
+        self._refresh_metro()
+
+    def _metro_drag_start(self, e):
+        self._metro_drag = (e.x, e.y, self.metro_center)
+
+    def _metro_drag_move(self, e):
+        if not self._metro_drag or self.metro_zoom <= 1.0:
+            return
+        x0, y0, start = self._metro_drag
+        scale = self._metro_geometry()[4]
+        if start is None or scale is None:
+            return
+        self.metro_center = (start[0] - (e.x - x0) / scale, start[1] - (e.y - y0) / scale)
+        self._metro_clamp_center()
+        self._refresh_metro()
+
+    def _metro_image(self, cw, ch, fw, fh, scale):
+        """PIL image for the current view and where its top-left goes.
+        Zoomed out: the shrunk preview frame. Zoomed in: a crop of the
+        FULL-resolution camera frame, so the detail is real, not upscaled."""
+        if self.metro_zoom <= 1.0:
+            img = Image.fromarray(self.last_display_frame)
+            size = (max(1, int(fw * scale)), max(1, int(fh * scale)))
+            return img.resize(size, Image.BILINEAR), (cw - size[0]) / 2.0, (ch - size[1]) / 2.0
+        raw = self.source.latest_raw() if self.source is not None else None
+        if raw is None or raw.shape[:2] != (fh, fw):
+            return None, 0, 0
+        cx, cy = self.metro_center
+        x0 = int(max(0, math.floor(cx - cw / scale / 2.0)))
+        y0 = int(max(0, math.floor(cy - ch / scale / 2.0)))
+        x1 = int(min(fw, math.ceil(cx + cw / scale / 2.0) + 1))
+        y1 = int(min(fh, math.ceil(cy + ch / scale / 2.0) + 1))
+        crop = raw[y0:y1, x0:x1]
+        step = max(1, int(1.0 / scale))           # more frame px than screen px: max-pool first
+        if step > 1:
+            hh, ww = (crop.shape[0] // step) * step, (crop.shape[1] // step) * step
+            crop = crop[:hh, :ww].reshape(hh // step, step, ww // step, step).max(axis=(1, 3))
+        mv = float(getattr(self.source, "max_value", 255) or 255)
+        if crop.dtype == np.uint8 and mv == 255:
+            crop8 = crop
+        else:
+            crop8 = np.clip(crop.astype(np.float32) * (255.0 / mv), 0, 255).astype(np.uint8)
+        eff = scale * step
+        size = (max(1, int(round(crop8.shape[1] * eff))), max(1, int(round(crop8.shape[0] * eff))))
+        img = Image.fromarray(np.ascontiguousarray(crop8)).resize(size, Image.NEAREST if eff >= 2 else Image.BILINEAR)
+        left = cw / 2.0 + (x0 - cx) * scale
+        top = ch / 2.0 + (y0 - cy) * scale
+        return img, left, top
 
     def _refresh_metro(self):
         if self.mode != "Metrology" or not hasattr(self, "metro_canvas"):
             return
         c = self.metro_canvas
         cw, ch = max(1, c.winfo_width()), max(1, c.winfo_height())
-        frame = self.last_display_frame if self.source is not None else None
         c.coords(self._metro_msg, cw / 2, ch / 2)
-        c.coords(self._metro_sat, cw / 2, ch - 12)
+        c.coords(self._metro_sat, cw / 2, ch - 30)
+        c.coords(self._metro_hint, 12, ch - 8)
+        c.coords(self._metro_zbar, cw - 10, 10)
         c.itemconfigure(self._metro_sat, text="SATURATED" if self.last_saturated else "")
-        if frame is None or not PIL_AVAILABLE or ImageTk is None:
+        if self.source is None or self.last_display_frame is None or not PIL_AVAILABLE or ImageTk is None:
             c.itemconfigure(self._metro_img_item, image="")
             self._metro_photo = None
             msg = ("No camera connected.\nSwitch to Alignment and choose a source on the Camera tab."
@@ -2230,16 +2412,24 @@ class DUVAutocollimatorGUI:
             c.itemconfigure(self._metro_msg, text=msg)
             c.itemconfigure(self._metro_info, text="")
             return
-        h, w = frame.shape[:2]
-        scale = min(cw / float(w), ch / float(h))
-        size = (max(1, int(w * scale)), max(1, int(h * scale)))
-        img = Image.fromarray(frame).resize(size, Image.NEAREST if scale >= 2 else Image.BILINEAR)
+        shape = (int(self.frame_h), int(self.frame_w))
+        if shape != self._metro_frame_shape:         # new ROI / source: start fitted
+            self._metro_frame_shape = shape
+            self.metro_zoom, self.metro_center = 1.0, None
+        self._metro_clamp_center()
+        cw, ch, fw, fh, scale = self._metro_geometry()
+        img, left, top = self._metro_image(cw, ch, fw, fh, scale)
+        if img is None:
+            return
         self._metro_photo = ImageTk.PhotoImage(img)     # keep a reference or Tk drops it
-        c.itemconfigure(self._metro_img_item, image=self._metro_photo)
-        c.coords(self._metro_img_item, cw / 2, ch / 2)
+        c.itemconfigure(self._metro_img_item, image=self._metro_photo, anchor="nw")
+        c.coords(self._metro_img_item, left, top)
         c.itemconfigure(self._metro_msg, text="")
         fps = f"{self.measured_fps:.1f} fps" if self.measured_fps > 0 else "-- fps"
-        c.itemconfigure(self._metro_info, text=f"{fps}   {self.frame_w}×{self.frame_h} px")
+        c.itemconfigure(self._metro_info, text=f"{fps}   {fw}×{fh} px   Zoom {self.metro_zoom:.1f}×")
+        self._sync_zoom_slider()
+        for item in (self._metro_info, self._metro_hint, self._metro_sat):
+            c.tag_raise(item)
 
     def _apply_text_size(self, name):
         """Scale every piece of GUI text (Tk widgets and plot text) from its
@@ -3158,40 +3348,84 @@ class DUVAutocollimatorGUI:
             w.configure(bg=color, fg=fg)
 
     def _ensure_alert_sounds(self):
-        try:
-            tmp_dir = tempfile.gettempdir()
-            self._alert_wav_out = os.path.join(tmp_dir, "duv_alert_out_of_tolerance_v2.wav")
-            self._alert_wav_in = os.path.join(tmp_dir, "duv_alert_in_tolerance_v2.wav")
-            if not os.path.exists(self._alert_wav_out):
-                self._write_chime(self._alert_wav_out, descending=True)
-            if not os.path.exists(self._alert_wav_in):
-                self._write_chime(self._alert_wav_in, descending=False)
-        except Exception:
-            self._alert_wav_out = self._alert_wav_in = None
+        """Sounds are generated on demand (per sound and volume) and cached
+        as small WAV files in the temp folder; see _alert_path."""
+        self._alert_cache = {}
 
     @staticmethod
-    def _write_chime(path, descending=True):
-        """Soft bell tone (a few decaying harmonics) — calm, not an alarm."""
-        sr, dur = 44100, 1.6
-        n = int(sr * dur)
-        t_arr = np.linspace(0, dur, n, False)
-        base = 293.66 if descending else 392.00
-        data = np.zeros(n)
-        for ratio, amp, decay in ((1.00, 1.00, 2.2), (2.00, 0.32, 3.0), (2.76, 0.16, 3.6), (4.00, 0.07, 4.2)):
-            data += amp * np.sin(2 * np.pi * base * ratio * t_arr) * np.exp(-decay * t_arr)
-        data /= max(1e-9, np.max(np.abs(data)))
-        data *= 0.18
-        attack = max(1, int(sr * 0.015))
-        data[:attack] *= np.linspace(0, 1, attack)
-        pcm = (np.clip(data, -1, 1) * 32767).astype(np.int16)
-        with wave.open(path, "w") as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(sr)
-            f.writeframes(pcm.tobytes())
+    def _synth_alert(sound, rising):
+        """One alert sound as samples in [-1, 1]. `rising` = the gentler
+        "back in tolerance" version (higher / upward)."""
+        sr = 44100
 
-    def _play_alert(self, went_in_tolerance):
-        path = self._alert_wav_in if went_in_tolerance else self._alert_wav_out
+        def tone(freq, dur, decay=0.0, harmonics=((1.0, 1.0),)):
+            t_arr = np.linspace(0, dur, int(sr * dur), False)
+            y = sum(a * np.sin(2 * np.pi * freq * r * t_arr) for r, a in harmonics)
+            if decay:
+                y = y * np.exp(-decay * t_arr)
+            fade = max(1, int(sr * 0.012))            # no clicks at the ends
+            y[:fade] *= np.linspace(0, 1, fade)
+            y[-fade:] *= np.linspace(1, 0, fade)
+            return y
+
+        def gap(dur):
+            return np.zeros(int(sr * dur))
+
+        if sound == "Beep":
+            y = tone(1046.5 if rising else 880.0, 0.22)
+        elif sound == "Double Beep":
+            f = 1046.5 if rising else 880.0
+            y = np.concatenate([tone(f, 0.12), gap(0.08), tone(f * (1.26 if rising else 1.0), 0.12)])
+        elif sound == "Low Tone":
+            y = tone(261.6 if rising else 196.0, 0.9, decay=2.0, harmonics=((1.0, 1.0), (2.0, 0.15)))
+        elif sound == "Alarm":
+            if rising:
+                y = np.concatenate([tone(660, 0.15), gap(0.05), tone(880, 0.2)])
+            else:
+                parts = []
+                for _ in range(3):
+                    parts += [tone(988, 0.14), tone(740, 0.14), gap(0.06)]
+                y = np.concatenate(parts)
+        else:   # Soft Chime: a few decaying bell harmonics, calm, not an alarm
+            base = 392.00 if rising else 293.66
+            y = tone(base, 1.6, decay=2.2,
+                     harmonics=((1.00, 1.00), (2.00, 0.32), (2.76, 0.16), (4.00, 0.07)))
+        return y / max(1e-9, float(np.max(np.abs(y))))
+
+    def _alert_path(self, rising):
+        sound = self.sound_var.get() if self.sound_var.get() in ALERT_SOUNDS else "Soft Chime"
+        volume = self.volume_var.get() if self.volume_var.get() in ALERT_VOLUMES else "Medium"
+        key = (sound, volume, rising)
+        path = self._alert_cache.get(key)
+        if path and os.path.exists(path):
+            return path
+        path = os.path.join(tempfile.gettempdir(), "duv_alert_{}_{}_{}.wav".format(
+            sound.replace(" ", ""), volume, "in" if rising else "out"))
+        try:
+            data = self._synth_alert(sound, rising) * ALERT_VOLUMES[volume]
+            pcm = (np.clip(data, -1, 1) * 32767).astype(np.int16)
+            with wave.open(path, "w") as f:
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.setframerate(44100)
+                f.writeframes(pcm.tobytes())
+        except Exception:
+            return None
+        self._alert_cache[key] = path
+        return path
+
+    def _update_mute_label(self):
+        self.mute_label.config(text="🔇 Sound muted" if self.mute_var.get() else "")
+
+    def _play_alert(self, went_in_tolerance, test=False):
+        """Tolerance sound. test=True plays the out-of-tolerance sound even
+        when muted (it is a preview from the Sound menu)."""
+        if not test:
+            if self.mute_var.get():
+                return
+            if went_in_tolerance and not self.return_chime_var.get():
+                return
+        path = self._alert_path(went_in_tolerance)
         if not path or not os.path.exists(path):
             return
         try:
@@ -3540,6 +3774,8 @@ class DUVAutocollimatorGUI:
             "software_rev": SOFTWARE_REV,
             "theme": self.theme_name,
             "text_size": self.text_size_var.get(),
+            "sound": {"name": self.sound_var.get(), "volume": self.volume_var.get(),
+                      "muted": bool(self.mute_var.get()), "return_chime": bool(self.return_chime_var.get())},
             "custom_theme": THEMES.get("Custom"),
             "mode": self.mode,
             "source": self.source_var.get(),
@@ -3582,6 +3818,13 @@ class DUVAutocollimatorGUI:
                 self.theme_var.set(self.theme_name)
             if st.get("text_size") in TEXT_SIZES:
                 self.text_size_var.set(st["text_size"])
+            snd = st.get("sound") or {}
+            if snd.get("name") in ALERT_SOUNDS:
+                self.sound_var.set(snd["name"])
+            if snd.get("volume") in ALERT_VOLUMES:
+                self.volume_var.set(snd["volume"])
+            self.mute_var.set(bool(snd.get("muted", False)))
+            self.return_chime_var.set(bool(snd.get("return_chime", True)))
             if st.get("mode") in MODES:
                 self.mode = st["mode"]
                 self.mode_var.set(self.mode)
